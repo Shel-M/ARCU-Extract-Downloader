@@ -4,10 +4,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::{ArgAction, Parser};
-use dotenvy_macro::dotenv;
+use dotenvy::{dotenv, var};
 use russh::{
     client::{self, KeyboardInteractiveAuthResponse},
     keys::PublicKey,
@@ -16,9 +16,10 @@ use russh::{
 use russh_sftp::client::{fs::DirEntry, SftpSession};
 use time::{macros::format_description, UtcOffset};
 use tokio::{fs, task::JoinSet};
+use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, trace, warn, Level};
-use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::{fmt, Layer};
 
 #[derive(Parser, Debug)]
 struct CLI {
@@ -43,13 +44,15 @@ struct Config {
 
 impl Config {
     fn new() -> Self {
-        let host = dotenv!("SYM_HOSTNAME").to_string();
+        dotenv().ok();
+        let host = dotenvy::var("SYM_HOSTNAME").unwrap().to_string();
         if !host.ends_with(":22") && host.contains(':') {
             warn!("Unrecognized port detected. Continuing as configured.")
         }
 
-        let syms = dotenv!("SYMS").to_string();
-        let password = dotenv!("SFTP_PASSWORD")
+        let syms = var("SYMS").unwrap().to_string();
+        let password = var("SFTP_PASSWORD")
+            .unwrap()
             .to_string()
             .replace(r#"\\"#, r#"\"#);
 
@@ -57,8 +60,8 @@ impl Config {
             password,
             host,
 
-            username: dotenv!("SFTP_USERNAME").to_string(),
-            destination_path: PathBuf::from(dotenv!("DESTINATION").to_string()),
+            username: var("SFTP_USERNAME").unwrap().to_string(),
+            destination_path: PathBuf::from(var("DESTINATION").unwrap().to_string()),
 
             syms: syms
                 .trim_matches(['[', ']'])
@@ -90,10 +93,15 @@ async fn main() -> anyhow::Result<()> {
         .with_timer(timer.clone())
         .with_level(true)
         .with_writer(non_blocking_file)
-        .with_ansi(false);
+        .with_ansi(false)
+        .with_filter(LevelFilter::from_level(cli.log));
 
     let console_log = if cli.stdout {
-        Some(tracing_subscriber::fmt::layer().with_timer(timer))
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_timer(timer)
+                .with_filter(LevelFilter::from_level(cli.log)),
+        )
     } else {
         None
     };
@@ -190,6 +198,7 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
         };
         for f in files_found.iter_mut().filter(|f| f.file_name == res.0) {
             f.local_path = res.1.clone();
+            f.is_empty = res.2;
         }
     }
     for file in files_found.iter_mut().filter(|f| f.local_path.is_empty()) {
@@ -202,8 +211,9 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
     for (i, file) in files_found.iter().enumerate() {
         match &*file.file_name {
             "EXTRACT_LASTFILE.txt" => last_file = Some(i),
-            "Episys_DataSupp_Statistics.txt" => { // todo: handle datasupp details later, but the
-                 // error this reports is non-critical
+            "Episys_DataSupp_Statistics.txt" => {
+                // todo: handle datasupp details later, but the
+                // error this reports on ARCU is non-critical; not a priority.
             }
             _ => {}
         }
@@ -211,25 +221,47 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
 
     if last_file.is_some() {
         debug!("Last file found. Moving other files.");
+        let mut moved = Vec::new();
         for file in files_found
             .iter()
             .filter(|f| f.file_name != "EXTRACT_LASTFILE.txt")
         {
-            debug!("Moving {}", file.local_path);
-            let mut file_destination = config.destination_path.clone();
-            file_destination.push(&file.file_name);
+            if !moved.contains(&file.local_path) {
+                debug!("Moving {}", file.local_path);
+                moved.push(file.local_path.clone());
+                let mut file_destination = config.destination_path.clone();
+                file_destination.push(&file.file_name);
 
-            fs::rename(&file.local_path, file_destination).await?
+                std::fs::rename(&file.local_path, &file_destination).context(format!(
+                    "Failed to move file '{}' to '{}'",
+                    file.local_path,
+                    &file_destination.display()
+                ))?
+            }
         }
 
         debug!("Moving last file.");
         let last_file = files_found.get(last_file.unwrap()).unwrap();
         let mut file_destination = config.destination_path.clone();
         file_destination.push(&last_file.file_name);
-        fs::rename(&last_file.local_path, file_destination).await?
+        std::fs::rename(&last_file.local_path, file_destination)?;
+
+        debug!("Checking for leftover files");
+        for file in files_found {
+            if Path::exists(&PathBuf::from(&file.local_path)) {
+                warn!("Leftover file found at {}", file.local_path);
+                if file.sym != *config.syms.last().unwrap() {
+                    let _ = std::fs::remove_file(file.local_path);
+                } else {
+                    std::fs::rename(file.local_path, format!(".\\extracts\\{}", file.file_name))?
+                }
+            }
+        }
+
+        return Ok(true);
     }
 
-    Ok(last_file.is_some())
+    Ok(false)
 }
 
 async fn connect(config: &Config, host: &String) -> anyhow::Result<SftpSession> {
@@ -370,6 +402,7 @@ struct ExtractFile {
     sym_path: String,
     file_name: String,
     local_path: String,
+    is_empty: bool,
 }
 
 impl ExtractFile {
@@ -379,10 +412,11 @@ impl ExtractFile {
             sym_path,
             file_name,
             local_path,
+            is_empty: false,
         }
     }
 
-    async fn download(self, session: Arc<SftpSession>) -> anyhow::Result<(String, String)> {
+    async fn download(self, session: Arc<SftpSession>) -> anyhow::Result<(String, String, bool)> {
         let local_dir = format!(r#".\extracts\{}"#, self.sym);
         let local_path = format!("{}\\{}", local_dir, self.file_name);
 
@@ -393,58 +427,87 @@ impl ExtractFile {
 
         if !self.local_path.is_empty() {
             warn!("File '{}' already downloaded!", self.file_name);
-            return Ok((self.file_name, local_path));
+            return Ok((self.file_name, local_path, self.is_empty));
         }
 
         if !Path::new(&local_dir).exists() {
             debug!(
-                "local extracts\\{} directory does not exist. Creating now.",
-                self.sym
+                "local '{}' directory does not exist. Creating now.",
+                local_dir
             );
-            fs::create_dir_all(&local_dir).await?;
+            fs::create_dir_all(&local_dir)
+                .await
+                .context(format!("Failed to create extract dir {local_dir}"))?;
         }
 
-        if fs::try_exists(&local_path).await? {
-            if fs::read_to_string(&local_path).await?.is_empty() {
+        if fs::try_exists(&local_path).await.context(format!(
+            "Failed to check if local file '{local_path}' exists."
+        ))? {
+            if fs::read_to_string(&local_path)
+                .await
+                .context(format!(
+                    "Failed to check if local file '{local_path}' was empty."
+                ))?
+                .is_empty()
+                && !self.is_empty
+            {
                 warn!(
                     "Empty file '{}' exists on local disk at '{}'. Overwriting...",
                     self.file_name, local_path
                 );
-                fs::remove_file(&local_path).await?;
+                fs::remove_file(&local_path)
+                    .await
+                    .context(format!("Failed to overwrite empty local file {local_path}"))?;
             } else {
                 debug!(
-                    "File '{}' exists on local disk at '{}'. Checking checksums...",
+                    "File '{}' exists on local disk at '{}'. Skipping.",
                     self.file_name, local_path
                 );
 
-                return Ok((self.file_name, local_path));
+                return Ok((self.file_name, local_path, self.is_empty));
             }
         } else {
             debug!("Creating local file {}", local_path);
-            fs::File::create_new(&local_path).await?;
+            fs::File::create_new(&local_path)
+                .await
+                .context(format!("Failed to create {local_path}"))?;
         }
 
         let mut local_md5 = md5::Context::new();
         let mut remote_md5 = md5::Context::new();
 
         debug!("Reading {} from remote directory", self.file_name);
-        let data = String::from_utf8(session.read(&self.sym_path).await?)?;
+        let sftp_data = session.read(&self.sym_path).await.context(format!(
+            "Failed to read data from remote directory for {}",
+            self.sym_path
+        ))?;
+        let sftp_data_empty = sftp_data.is_empty();
+        let data = String::from_utf8(sftp_data).context(format!(
+            "Could not convert remote data for '{}' to utf8",
+            self.sym_path
+        ))?;
         remote_md5.consume(&data);
 
         debug!("Writing {} to local file at {}", self.file_name, local_path);
-        fs::write(&local_path, data).await?;
+        fs::write(&local_path, data).await.context(format!(
+            "Could not write local file '{local_path}' with remote data."
+        ))?;
 
-        let local_file_contents = fs::read_to_string(&local_path).await?;
+        let local_file_contents = fs::read_to_string(&local_path).await.context(format!(
+            "Could not read local file '{local_path}' back to check validity"
+        ))?;
         local_md5.consume(&local_file_contents);
 
         let remote_check = remote_md5.compute();
         let local_check = local_md5.compute();
         if remote_check != local_check {
             error!("File checksums do not match!");
-            fs::remove_file(&local_path).await?;
+            fs::remove_file(&local_path).await.context(format!(
+                "Could not remove file with invalid checksum {local_path}"
+            ))?;
             return Err(std::io::Error::last_os_error().into());
         }
 
-        return Ok((self.file_name, local_path));
+        return Ok((self.file_name, local_path, sftp_data_empty));
     }
 }
