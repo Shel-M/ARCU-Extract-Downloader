@@ -1,0 +1,450 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::Result;
+use async_trait::async_trait;
+use clap::{ArgAction, Parser};
+use dotenvy_macro::dotenv;
+use russh::{
+    client::{self, KeyboardInteractiveAuthResponse},
+    keys::PublicKey,
+    ChannelId,
+};
+use russh_sftp::client::{fs::DirEntry, SftpSession};
+use time::{macros::format_description, UtcOffset};
+use tokio::{fs, task::JoinSet};
+use tracing::{debug, error, info, trace, warn, Level};
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+
+#[derive(Parser, Debug)]
+struct CLI {
+    #[arg(long, action = ArgAction::SetTrue)]
+    stdout: bool,
+
+    #[arg(short, long, default_value_t = Level::WARN)]
+    log: Level,
+
+    #[arg(long, default_value_t = String::new())]
+    host: String,
+}
+
+#[derive(Debug)]
+struct Config {
+    username: String,
+    password: String,
+    host: String,
+    syms: Vec<u16>,
+    destination_path: PathBuf,
+}
+
+impl Config {
+    fn new() -> Self {
+        let host = dotenv!("SYM_HOSTNAME").to_string();
+        if !host.ends_with(":22") && host.contains(':') {
+            warn!("Unrecognized port detected. Continuing as configured.")
+        }
+
+        let syms = dotenv!("SYMS").to_string();
+        let password = dotenv!("SFTP_PASSWORD")
+            .to_string()
+            .replace(r#"\\"#, r#"\"#);
+
+        Self {
+            password,
+            host,
+
+            username: dotenv!("SFTP_USERNAME").to_string(),
+            destination_path: PathBuf::from(dotenv!("DESTINATION").to_string()),
+
+            syms: syms
+                .trim_matches(['[', ']'])
+                .split(',')
+                .map(|s| {
+                    trace!("Parsing {s} to integer");
+                    s.trim().parse().unwrap()
+                })
+                .collect(),
+        }
+    }
+}
+
+const DAY: u64 = 86400;
+const HOUR: u64 = 3600;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = CLI::parse();
+
+    let timer_format =
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second] [period]");
+    let timer = fmt::time::OffsetTime::new(UtcOffset::current_local_offset()?, timer_format);
+
+    let appender = tracing_appender::rolling::daily("./logs", "log_test.log");
+    let (non_blocking_file, _guard) = tracing_appender::non_blocking(appender);
+
+    let file_log = tracing_subscriber::fmt::layer()
+        .with_timer(timer.clone())
+        .with_level(true)
+        .with_writer(non_blocking_file)
+        .with_ansi(false);
+
+    let console_log = if cli.stdout {
+        Some(tracing_subscriber::fmt::layer().with_timer(timer))
+    } else {
+        None
+    };
+
+    let logging = tracing_subscriber::registry()
+        .with(file_log)
+        .with(console_log);
+    tracing::subscriber::set_global_default(logging).expect("Unable to set up logging");
+    trace!("Startup complete");
+
+    trace!("Collecting configuration");
+
+    let config = Config::new();
+
+    loop {
+        let mut done = false;
+        match process(&config, &cli).await {
+            Ok(process_done) => done = process_done,
+            Err(e) => error!("Error processing {e}"),
+        }
+
+        if cfg!(debug_assertions) {
+            debug!("Exiting due to running in debug. If this is not intended, compile with 'cargo build --release'");
+            break;
+        }
+        if done {
+            debug!(
+                "Full completion of processing detected. Waiting one hour before checking for new files."
+            );
+            tokio::time::sleep(Duration::from_secs(HOUR)).await;
+        } else {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
+    let session = Arc::from(connect(&config, &cli.host).await?);
+    let mut last_file = None;
+
+    let mut files_found: Vec<ExtractFile> = Vec::new();
+    for sym in &config.syms {
+        let dir = format!("/SYM/SYM{}/SQLEXTRACT", sym);
+        let mut sym_files = get_files(&session, &dir, |_| true).await?;
+
+        let dir = format!("/SYM/SYM{}/LETTERSPECS", sym);
+
+        sym_files.append(
+            &mut get_files(&session, &dir, |f| {
+                !f.file_name().contains("DataSupp.")
+                    && (f.file_name().starts_with("EXTRACT.")
+                        || f.file_name().starts_with("FMT.")
+                        || f.file_name().starts_with("MACRO.")
+                        || f.file_name().starts_with("Close_Day_Trial_Balance_")
+                        || f.file_name() == "Episys_DataSupp_Statistics.txt"
+                        || f.file_name() == "Episys_Database__Extract_Statistics.txt"
+                        || f.file_name() == "EXTRACT_LASTFILE.txt")
+            })
+            .await?,
+        );
+
+        files_found.append(
+            &mut (sym_files
+                .iter()
+                .map(|f| {
+                    ExtractFile::new(
+                        *sym,
+                        f.to_string(),
+                        f[f.rfind('/').unwrap() + 1..].to_string(),
+                        String::new(),
+                    )
+                })
+                .collect()),
+        );
+    }
+
+    trace!("{files_found:#?}");
+    // Download files asyncronously from remote.
+    // Retries downloads once.
+    let mut set = JoinSet::new();
+    for file in &files_found {
+        set.spawn(file.clone().download(session.clone()));
+    }
+    let results = set.join_all().await;
+    for res in results {
+        let res = match res {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Error downloading file {e}");
+                continue;
+            }
+        };
+        for f in files_found.iter_mut().filter(|f| f.file_name == res.0) {
+            f.local_path = res.1.clone();
+        }
+    }
+    for file in files_found.iter_mut().filter(|f| f.local_path.is_empty()) {
+        warn!("{0} Failed to download. Retrying...", file.file_name);
+        let result = file.clone().download(session.clone()).await?;
+        file.local_path = result.1;
+    }
+    session.close().await?;
+
+    for (i, file) in files_found.iter().enumerate() {
+        match &*file.file_name {
+            "EXTRACT_LASTFILE.txt" => last_file = Some(i),
+            "Episys_DataSupp_Statistics.txt" => { // todo: handle datasupp details later, but the
+                 // error this reports is non-critical
+            }
+            _ => {}
+        }
+    }
+
+    if last_file.is_some() {
+        debug!("Last file found. Moving other files.");
+        for file in files_found
+            .iter()
+            .filter(|f| f.file_name != "EXTRACT_LASTFILE.txt")
+        {
+            debug!("Moving {}", file.local_path);
+            let mut file_destination = config.destination_path.clone();
+            file_destination.push(&file.file_name);
+
+            fs::rename(&file.local_path, file_destination).await?
+        }
+
+        debug!("Moving last file.");
+        let last_file = files_found.get(last_file.unwrap()).unwrap();
+        let mut file_destination = config.destination_path.clone();
+        file_destination.push(&last_file.file_name);
+        fs::rename(&last_file.local_path, file_destination).await?
+    }
+
+    Ok(last_file.is_some())
+}
+
+async fn connect(config: &Config, host: &String) -> anyhow::Result<SftpSession> {
+    let host = if !host.is_empty() {
+        if !host.contains(":") {
+            warn!("No port on hostname '{host}'. Defaulting to 22.")
+        }
+        host
+    } else {
+        &config.host.to_string()
+    };
+
+    let host_split = host
+        .split(':')
+        .map(|s| s.to_string())
+        .collect::<Vec<String>>();
+    let host = host_split[0].clone();
+    let port = host_split[1].parse().unwrap_or(22);
+
+    debug!("Connecting to host '{}'", host);
+    let russh_config = russh::client::Config::default();
+
+    let sh = Client {};
+    let mut session = russh::client::connect(Arc::new(russh_config), (host, port), sh).await?;
+
+    let mut interactive_response = session
+        .authenticate_keyboard_interactive_start(config.username.clone(), None)
+        .await?;
+
+    loop {
+        match interactive_response {
+            KeyboardInteractiveAuthResponse::Success => {
+                debug!("Keyboard authentication successful");
+                break;
+            }
+            KeyboardInteractiveAuthResponse::Failure => {
+                error!("Keyboard authentication failure");
+                return Err(russh::Error::NotAuthenticated.into());
+            }
+            KeyboardInteractiveAuthResponse::InfoRequest {
+                ref name,
+                ref instructions,
+                ref prompts,
+            } => {
+                debug!("Received {name}, {instructions}. Prompts {:?} ", prompts);
+
+                let resp = prompts
+                    .iter()
+                    .filter(|p| p.prompt.to_lowercase().contains("password"))
+                    .map(|_| config.password.clone())
+                    .collect::<Vec<String>>();
+                interactive_response = session
+                    .authenticate_keyboard_interactive_respond(resp)
+                    .await?;
+            }
+        }
+    }
+
+    let channel = session.channel_open_session().await?;
+    channel.request_subsystem(true, "sftp").await?;
+
+    Ok(SftpSession::new(channel.into_stream()).await?)
+}
+
+/// Finds and pulls files from a given directory which were modified in the last day.
+/// Returns a list of file paths.
+/// get_files will traverse subdirectories, but only one level deep.
+/// the 'filter' parameter is an additional iter::filter predicate for the files in the directory.
+async fn get_files<P>(session: &SftpSession, dir: &String, filter: P) -> anyhow::Result<Vec<String>>
+where
+    P: FnMut(&DirEntry) -> bool,
+{
+    let mut result = Vec::new();
+
+    // If running debug, we can
+    // grab the last day of files. If not, just the last hour should do it.
+    let file_age = if cfg!(debug_assertions) { DAY } else { HOUR };
+
+    for entry in session
+        .read_dir(dir)
+        .await?
+        .into_iter()
+        .filter(filter)
+        .filter(|f| {
+            f.metadata().modified().unwrap()
+                > SystemTime::now()
+                    .checked_sub(Duration::from_secs(file_age))
+                    .unwrap()
+        })
+    {
+        debug!("file in dir: {dir} {:?}", entry.file_name());
+
+        if entry.file_type().is_dir() {
+            let dir = format!("{dir}/{}", entry.file_name());
+            for file in session.read_dir(&dir).await? {
+                if !file.file_type().is_dir() {
+                    debug!("file in dir: {dir} {:?}", file.file_name());
+
+                    result.push(format!("{dir}/{}", file.file_name()));
+                }
+            }
+        } else {
+            result.push(format!("{dir}/{}", entry.file_name()));
+        }
+    }
+
+    Ok(result)
+}
+
+struct Client {}
+
+#[async_trait]
+impl client::Handler for Client {
+    type Error = anyhow::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
+        info!("check_server_key: {:?}", server_public_key);
+        Ok(true)
+    }
+
+    async fn data(
+        &mut self,
+        _channel: ChannelId,
+        _data: &[u8],
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        //trace!("data on channel {:?}: {}", channel, data.len());
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExtractFile {
+    sym: u16,
+    sym_path: String,
+    file_name: String,
+    local_path: String,
+}
+
+impl ExtractFile {
+    fn new(sym: u16, sym_path: String, file_name: String, local_path: String) -> Self {
+        ExtractFile {
+            sym,
+            sym_path,
+            file_name,
+            local_path,
+        }
+    }
+
+    async fn download(self, session: Arc<SftpSession>) -> anyhow::Result<(String, String)> {
+        let local_dir = format!(r#".\extracts\{}"#, self.sym);
+        let local_path = format!("{}\\{}", local_dir, self.file_name);
+
+        debug!(
+            "Downloading {} from {} to {}",
+            self.file_name, self.sym_path, local_path
+        );
+
+        if !self.local_path.is_empty() {
+            warn!("File '{}' already downloaded!", self.file_name);
+            return Ok((self.file_name, local_path));
+        }
+
+        if !Path::new(&local_dir).exists() {
+            debug!(
+                "local extracts\\{} directory does not exist. Creating now.",
+                self.sym
+            );
+            fs::create_dir_all(&local_dir).await?;
+        }
+
+        if fs::try_exists(&local_path).await? {
+            if fs::read_to_string(&local_path).await?.is_empty() {
+                warn!(
+                    "Empty file '{}' exists on local disk at '{}'. Overwriting...",
+                    self.file_name, local_path
+                );
+                fs::remove_file(&local_path).await?;
+            } else {
+                debug!(
+                    "File '{}' exists on local disk at '{}'. Checking checksums...",
+                    self.file_name, local_path
+                );
+
+                return Ok((self.file_name, local_path));
+            }
+        } else {
+            debug!("Creating local file {}", local_path);
+            fs::File::create_new(&local_path).await?;
+        }
+
+        let mut local_md5 = md5::Context::new();
+        let mut remote_md5 = md5::Context::new();
+
+        debug!("Reading {} from remote directory", self.file_name);
+        let data = String::from_utf8(session.read(&self.sym_path).await?)?;
+        remote_md5.consume(&data);
+
+        debug!("Writing {} to local file at {}", self.file_name, local_path);
+        fs::write(&local_path, data).await?;
+
+        let local_file_contents = fs::read_to_string(&local_path).await?;
+        local_md5.consume(&local_file_contents);
+
+        let remote_check = remote_md5.compute();
+        let local_check = local_md5.compute();
+        if remote_check != local_check {
+            error!("File checksums do not match!");
+            fs::remove_file(&local_path).await?;
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        return Ok((self.file_name, local_path));
+    }
+}
