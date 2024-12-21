@@ -243,6 +243,8 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
         }
 
         debug!("Moving last file.");
+        return Ok(true);
+
         let last_file = files_found.get(last_file.unwrap()).unwrap();
         let mut file_destination = config.destination_path.clone();
         file_destination.push(&last_file.file_name);
@@ -341,6 +343,7 @@ where
     // If running debug, we can
     // grab the last day of files. If not, just the last hour should do it.
     let file_age = if cfg!(debug_assertions) { DAY } else { HOUR };
+    let file_age = DAY;
 
     for entry in session
         .read_dir(dir)
@@ -479,10 +482,23 @@ impl ExtractFile {
         let mut remote_md5 = md5::Context::new();
 
         debug!("Reading {} from remote directory", self.file_name);
-        let sftp_data = session.read(&self.sym_path).await.context(format!(
+        let data_len = session
+            .metadata(&self.sym_path)
+            .await
+            .context(format!("Could not read file len for {}", self.sym_path))?;
+        let mut sftp_data = session.read(&self.sym_path).await.context(format!(
             "Failed to read data from remote directory for {}",
             self.sym_path
         ))?;
+        while sftp_data.len() < data_len.len().try_into().unwrap() {
+            // I couldn't help myself. I did this like immediately after you left my place.
+            // Plus side, it took like 3 minutes. ~Sheldon
+            warn!("sftp_data too short. Redownloading.");
+            sftp_data = session.read(&self.sym_path).await.context(format!(
+                "Failed to read data from remote directory for {}",
+                self.sym_path
+            ))?;
+        }
         let sftp_data_empty = sftp_data.is_empty();
         let data = String::from_utf8(sftp_data).context(format!(
             "Could not convert remote data for '{}' to utf8",
