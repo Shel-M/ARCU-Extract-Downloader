@@ -183,11 +183,13 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
     trace!("{files_found:#?}");
     // Download files asyncronously from remote.
     // Retries downloads once.
-    let mut set = JoinSet::new();
+    //let mut set = JoinSet::new();
+    let mut results = Vec::new();
     for file in &files_found {
-        set.spawn(file.clone().download(session.clone()));
+        results.push(file.clone().download(session.clone()).await);
     }
-    let results = set.join_all().await;
+    //let results = set.join_all().await;
+
     for res in results {
         let res = match res {
             Ok(r) => r,
@@ -486,6 +488,7 @@ impl ExtractFile {
             "Could not convert remote data for '{}' to utf8",
             self.sym_path
         ))?;
+        let data = data.replace('\n', "\r\n");
         remote_md5.consume(&data);
 
         debug!("Writing {} to local file at {}", self.file_name, local_path);
