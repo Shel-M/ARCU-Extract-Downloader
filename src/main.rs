@@ -180,6 +180,13 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
         );
     }
 
+    // David, Remove this once the normal extract FTPs to ARCUP are gone from ARCU.358 & ARCU.658.
+    // Feel free to text me if you need to know more about exactly which jobs need removed, but they're all
+    // named ARCUP.+ ~ Sheldon M.
+    if !files_found.is_empty() {
+        tokio::time::sleep(Duration::from_secs(HOUR)).await;
+    }
+
     trace!("{files_found:#?}");
     // Download files asyncronously from remote.
     // Retries downloads once.
@@ -243,8 +250,6 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
         }
 
         debug!("Moving last file.");
-        return Ok(true);
-
         let last_file = files_found.get(last_file.unwrap()).unwrap();
         let mut file_destination = config.destination_path.clone();
         file_destination.push(&last_file.file_name);
@@ -343,7 +348,6 @@ where
     // If running debug, we can
     // grab the last day of files. If not, just the last hour should do it.
     let file_age = if cfg!(debug_assertions) { DAY } else { HOUR };
-    let file_age = DAY;
 
     for entry in session
         .read_dir(dir)
@@ -491,8 +495,10 @@ impl ExtractFile {
             self.sym_path
         ))?;
         while sftp_data.len() < data_len.len().try_into().unwrap() {
+            // David,
             // I couldn't help myself. I did this like immediately after you left my place.
-            // Plus side, it took like 3 minutes. ~Sheldon
+            // Plus side, it took like 3 minutes. Search for your name for one other change that
+            // needs to be done. ~Sheldon
             warn!("sftp_data too short. Redownloading.");
             sftp_data = session.read(&self.sym_path).await.context(format!(
                 "Failed to read data from remote directory for {}",
