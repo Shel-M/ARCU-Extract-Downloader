@@ -15,7 +15,7 @@ use russh::{
 };
 use russh_sftp::client::{fs::DirEntry, SftpSession};
 use time::{macros::format_description, UtcOffset};
-use tokio::{fs, task::JoinSet};
+use tokio::fs;
 use tracing::level_filters::LevelFilter;
 use tracing::{debug, error, info, trace, warn, Level};
 use tracing_subscriber::layer::SubscriberExt;
@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         Some(
             tracing_subscriber::fmt::layer()
                 .with_timer(timer)
+                .with_ansi(false)
                 .with_filter(LevelFilter::from_level(cli.log)),
         )
     } else {
@@ -131,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
             debug!(
                 "Full completion of processing detected. Waiting one hour before checking for new files."
             );
-            tokio::time::sleep(Duration::from_secs(HOUR)).await;
+            tokio::time::sleep(Duration::from_secs(HOUR + 1800)).await;
         } else {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
@@ -184,7 +185,8 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
     // Feel free to text me if you need to know more about exactly which jobs need removed, but they're all
     // named ARCUP.+ ~ Sheldon M.
     if !files_found.is_empty() {
-        tokio::time::sleep(Duration::from_secs(HOUR)).await;
+        debug!("Waiting 1 hour for batch job completion");
+        //tokio::time::sleep(Duration::from_secs(HOUR)).await;
     }
 
     trace!("{files_found:#?}");
@@ -217,12 +219,21 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
     }
     session.close().await?;
 
+    let mut datasupp_processed = false;
     for (i, file) in files_found.iter().enumerate() {
         match &*file.file_name {
             "EXTRACT_LASTFILE.txt" => last_file = Some(i),
             "Episys_DataSupp_Statistics.txt" => {
                 // todo: handle datasupp details later, but the
                 // error this reports on ARCU is non-critical; not a priority.
+                let datasupp_files = files_found.clone();
+                let datasupp_files = datasupp_files
+                    .iter()
+                    .filter(|f| f.file_name == file.file_name)
+                    .collect::<Vec<&ExtractFile>>();
+                if datasupp_files.len() > 1 {
+                    combine_datasupp(config, datasupp_files, &mut datasupp_processed);
+                }
             }
             _ => {}
         }
@@ -303,7 +314,7 @@ async fn connect(config: &Config, host: &String) -> anyhow::Result<SftpSession> 
     loop {
         match interactive_response {
             KeyboardInteractiveAuthResponse::Success => {
-                debug!("Keyboard authentication successful");
+                trace!("Keyboard authentication successful");
                 break;
             }
             KeyboardInteractiveAuthResponse::Failure => {
@@ -315,7 +326,7 @@ async fn connect(config: &Config, host: &String) -> anyhow::Result<SftpSession> 
                 ref instructions,
                 ref prompts,
             } => {
-                debug!("Received {name}, {instructions}. Prompts {:?} ", prompts);
+                trace!("Received {name}, {instructions}. Prompts {:?} ", prompts);
 
                 let resp = prompts
                     .iter()
@@ -347,7 +358,11 @@ where
 
     // If running debug, we can
     // grab the last day of files. If not, just the last hour should do it.
-    let file_age = if cfg!(debug_assertions) { DAY } else { HOUR };
+    let file_age = if cfg!(debug_assertions) {
+        DAY
+    } else {
+        HOUR + 1800
+    };
 
     for entry in session
         .read_dir(dir)
@@ -495,11 +510,8 @@ impl ExtractFile {
             self.sym_path
         ))?;
         while sftp_data.len() < data_len.len().try_into().unwrap() {
-            // David,
-            // I couldn't help myself. I did this like immediately after you left my place.
-            // Plus side, it took like 3 minutes. Search for your name for one other change that
-            // needs to be done. ~Sheldon
             warn!("sftp_data too short. Redownloading.");
+            tokio::time::sleep(Duration::from_secs(5)).await;
             sftp_data = session.read(&self.sym_path).await.context(format!(
                 "Failed to read data from remote directory for {}",
                 self.sym_path
@@ -535,4 +547,74 @@ impl ExtractFile {
 
         return Ok((self.file_name, local_path, sftp_data_empty));
     }
+}
+
+fn combine_datasupp(
+    config: &Config,
+    files: Vec<&ExtractFile>,
+    status: &mut bool,
+) -> Result<ExtractFile> {
+    debug!("Combining datasupp statistics files");
+    if *status || files.len() == 1 {
+        return Ok((*files.last().unwrap()).clone());
+    }
+
+    struct Total {
+        tot: u64,
+        full: bool,
+    }
+
+    let mut account_total = Total {
+        tot: 0,
+        full: false,
+    };
+    let mut loan_total = Total {
+        tot: 0,
+        full: false,
+    };
+    let mut share_total = Total {
+        tot: 0,
+        full: false,
+    };
+
+    // 358 file
+    // A:000000017911
+    // A:000000017911
+    // A:000000017911
+    // A:000000017911
+    // L:000000013916
+    // L:000000013915
+    // L:000000013915
+    // L:000000013915
+    // 658 file
+    // AccountDataSupp:000000071644
+    // LoanDataSupp:000000055661
+    // ShareDataSupp:000000133527
+
+    for file in files {
+        let content = std::fs::read_to_string(&file.local_path)?;
+        let content: Vec<&str> = content.split("\r\n").collect();
+
+        for line in content {
+            let Some((label, content)) = line.split_once(':') else {
+                continue;
+            };
+
+            let (mut label, mut count) = ("", "");
+            let split = line.split_once(':');
+            if split.is_some() {
+                (label, count) = split.unwrap();
+            }
+
+            debug!("{label}, {count}")
+        }
+    }
+
+    Ok(ExtractFile {
+        sym: 658,
+        sym_path: String::new(),
+        file_name: String::new(),
+        local_path: String::new(),
+        is_empty: false,
+    })
 }
