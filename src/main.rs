@@ -181,6 +181,12 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
         );
     }
 
+    // Todo: implement a better way to wait for job completion
+    if !files_found.is_empty() {
+        debug!("Waiting 1 hour for batch job to complete.");
+        tokio::time::sleep(Duration::from_secs(HOUR)).await; //
+    }
+
     trace!("{files_found:#?}");
     // Download files asyncronously from remote.
     // Retries downloads once.
@@ -211,11 +217,16 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
     }
     session.close().await?;
 
+    #[allow(unused)]
     let mut datasupp_processed = false;
+
     for (i, file) in files_found.iter().enumerate() {
         match &*file.file_name {
             "EXTRACT_LASTFILE.txt" => last_file = Some(i),
             "Episys_DataSupp_Statistics.txt" => {
+                continue;
+
+                #[allow(unreachable_code)]
                 // todo: handle datasupp details later, but the
                 // error this reports on ARCU is non-critical; not a priority.
                 let datasupp_files = files_found.clone();
@@ -224,7 +235,7 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
                     .filter(|f| f.file_name == file.file_name)
                     .collect::<Vec<&ExtractFile>>();
                 if datasupp_files.len() > 1 {
-                    combine_datasupp(config, datasupp_files, &mut datasupp_processed);
+                    let _ = combine_datasupp(datasupp_files, &mut datasupp_processed);
                 }
             }
             _ => {}
@@ -552,11 +563,8 @@ impl ExtractFile {
     }
 }
 
-fn combine_datasupp(
-    config: &Config,
-    files: Vec<&ExtractFile>,
-    status: &mut bool,
-) -> Result<ExtractFile> {
+#[allow(dead_code, unused)] // incomplete function
+fn combine_datasupp(files: Vec<&ExtractFile>, status: &mut bool) -> Result<ExtractFile> {
     debug!("Combining datasupp statistics files");
     if *status || files.len() == 1 {
         return Ok((*files.last().unwrap()).clone());
