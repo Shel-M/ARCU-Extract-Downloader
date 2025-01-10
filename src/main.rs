@@ -158,9 +158,9 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
                     && (f.file_name().starts_with("EXTRACT.")
                         || f.file_name().starts_with("FMT.")
                         || f.file_name().starts_with("MACRO.")
-                        || f.file_name().starts_with("Close_Day_Trial_Balance_")
+                        || f.file_name() == ("CD_Trial_Bal_for_")
                         || f.file_name() == "Episys_DataSupp_Statistics.txt"
-                        || f.file_name() == "Episys_Database__Extract_Statistics.txt"
+                        || f.file_name() == "Episys_Database__Extract_Stats"
                         || f.file_name() == "EXTRACT_LASTFILE.txt")
             })
             .await?,
@@ -253,7 +253,18 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
                 debug!("Moving {}", file.local_path);
                 moved.push(file.local_path.clone());
                 let mut file_destination = config.destination_path.clone();
-                file_destination.push(&file.file_name);
+                // These files hit length limits for converting to letter files
+                // so, we'll rename to the expected format here
+                if file.file_name ==* "Episys_Database__Extract_Stats" {
+                    file_destination.push("Episys_Database__Extract_Statistics.txt");
+                } else if file.file_name.starts_with("CD_Trial_Bal_for_") {
+                    // IE CD_Trial_Bal_for_01_03_24
+                    let date = &file.file_name[17..24];
+                    file_destination.push("Close_Day_Trial_Balance_for_".to_owned() + date + ".txt");
+                } else {
+                    file_destination.push(&file.file_name);
+                }
+
 
                 std::fs::rename(&file.local_path, &file_destination).context(format!(
                     "Failed to move file '{}' to '{}'",
