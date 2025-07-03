@@ -4,7 +4,6 @@ use tracing::{trace, warn};
 
 #[derive(Debug)]
 pub struct Config {
-    pub working_directory: PathBuf,
     pub username: String,
     pub password: String,
     pub host: String,
@@ -31,9 +30,6 @@ impl Config {
 
         dotenv().ok();
 
-        let working_directory =
-            PathBuf::from(dotenvy::var("WORKING_DIRECTORY").unwrap_or(".\\".to_string()));
-
         let host = dotenvy::var("SYM_HOSTNAME").unwrap().to_string();
         if !host.ends_with(":22") && host.contains(':') {
             warn!("Unrecognized port detected. Continuing as configured.")
@@ -46,7 +42,6 @@ impl Config {
             .replace(r#"\\"#, r#"\"#);
 
         Self {
-            working_directory,
             password,
             host,
 
