@@ -1,13 +1,18 @@
+mod config;
+mod extract_file;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use anyhow::{Context, Result};
-use async_trait::async_trait;
+use crate::config::Config;
+use crate::extract_file::ExtractFile;
+
+use anyhow::{anyhow, Context, Result};
 use clap::{ArgAction, Parser};
-use dotenvy::{dotenv, var};
+use runas::Command;
 use russh::{
     client::{self, KeyboardInteractiveAuthResponse},
     keys::PublicKey,
@@ -15,14 +20,13 @@ use russh::{
 };
 use russh_sftp::client::{fs::DirEntry, SftpSession};
 use time::{macros::format_description, UtcOffset};
-use tokio::fs;
-use tracing::level_filters::LevelFilter;
-use tracing::{debug, error, info, trace, warn, Level};
+use tracing::{debug, error, trace, warn, Level};
+use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{fmt, Layer};
 
 #[derive(Parser, Debug)]
-struct CLI {
+struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     stdout: bool,
 
@@ -31,61 +35,27 @@ struct CLI {
 
     #[arg(long, default_value_t = String::new())]
     host: String,
-}
 
-#[derive(Debug)]
-struct Config {
-    username: String,
-    password: String,
-    host: String,
-    syms: Vec<u16>,
-    destination_path: PathBuf,
-}
+    #[arg(long, action = ArgAction::SetTrue)]
+    service: bool,
 
-impl Config {
-    fn new() -> Self {
-        dotenv().ok();
-        let host = dotenvy::var("SYM_HOSTNAME").unwrap().to_string();
-        if !host.ends_with(":22") && host.contains(':') {
-            warn!("Unrecognized port detected. Continuing as configured.")
-        }
-
-        let syms = var("SYMS").unwrap().to_string();
-        let password = var("SFTP_PASSWORD")
-            .unwrap()
-            .to_string()
-            .replace(r#"\\"#, r#"\"#);
-
-        Self {
-            password,
-            host,
-
-            username: var("SFTP_USERNAME").unwrap().to_string(),
-            destination_path: PathBuf::from(var("DESTINATION").unwrap().to_string()),
-
-            syms: syms
-                .trim_matches(['[', ']'])
-                .split(',')
-                .map(|s| {
-                    trace!("Parsing {s} to integer");
-                    s.trim().parse().unwrap()
-                })
-                .collect(),
-        }
-    }
+    #[arg(long, action = ArgAction::SetTrue)]
+    install: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    uninstall: bool,
 }
 
 const DAY: u64 = 86400;
 const HOUR: u64 = 3600;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = CLI::parse();
+pub async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
 
     let timer_format =
         format_description!("[year]-[month]-[day] [hour]:[minute]:[second] [period]");
     let timer = fmt::time::OffsetTime::new(UtcOffset::current_local_offset()?, timer_format);
-
+    #[allow(unused)]
     let appender = tracing_appender::rolling::daily("./logs", "log_test.log");
     let (non_blocking_file, _guard) = tracing_appender::non_blocking(appender);
 
@@ -115,18 +85,73 @@ async fn main() -> anyhow::Result<()> {
 
     trace!("Collecting configuration");
 
-    let config = Config::new();
+    if cli.install {
+        let bin_path = std::env::current_exe()
+            .context("Couldn't get executable path.")?
+            .as_path()
+            .canonicalize()
+            .context("Couldn't get executable path.")?;
+        // let bin_path = bin_path.to_str();
+        // if bin_path.is_none() {
+        //     return Err(anyhow!("Couldn't get executable path."));
+        // }
+        // let bin_path = bin_path.unwrap();
+        // println!("{}", &(&bin_path)[4..]);
+        // return Ok(());
+        // let bin_path = &bin_path[4..];
 
+        let status = Command::new("sc.exe")
+            .arg("create")
+            .arg("ARCU PCCU Extract Downloader")
+            .arg("binPath=".to_owned())
+            .arg(bin_path)
+            .status()
+            .context("Error installing service")?;
+        if !status.success() {
+            return Err(anyhow!(
+                "Could not install service: {}",
+                status.code().unwrap_or(-99)
+            ));
+        }
+        return Ok(());
+    }
+    if cli.uninstall {
+        let status = Command::new("sc.exe")
+            .arg("delete")
+            .arg("ARCU PCCU Extract Downloader")
+            .status()
+            .context("Error uninstalling service")?;
+        if !status.success() {
+            return Err(anyhow!(
+                "Could not uninstall service: {}",
+                status.code().unwrap_or(-99)
+            ));
+        }
+        return Ok(());
+    }
+
+    if cli.service {
+        windows_services::Service::new().can_stop().run(|command| {
+            info!("Windows Service Command: {command:#?}");
+            tokio::task::spawn_blocking(async || run().await);
+        })
+    } else {
+        run().await
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
+    let (config, cli) = (Config::new(), Cli::parse());
     loop {
         let mut done = false;
         match process(&config, &cli).await {
-            Ok(process_done) => done = process_done,
+            Ok(is_done) => done = is_done,
             Err(e) => error!("Error processing {e}"),
         }
 
         if cfg!(debug_assertions) {
             debug!("Exiting due to running in debug. If this is not intended, compile with 'cargo build --release'");
-            break;
+            break Ok(());
         }
         if done {
             debug!(
@@ -137,20 +162,18 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
     }
-
-    Ok(())
 }
 
-async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
-    let session = Arc::from(connect(&config, &cli.host).await?);
+async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
+    let session = Arc::from(connect(config, &cli.host).await?);
     let mut last_file = None;
 
     let mut files_found: Vec<ExtractFile> = Vec::new();
     for sym in &config.syms {
-        let dir = format!("/SYM/SYM{}/SQLEXTRACT", sym);
+        let dir = format!("/SYM/SYM{sym}/SQLEXTRACT");
         let mut sym_files = get_files(&session, &dir, |_| true).await?;
 
-        let dir = format!("/SYM/SYM{}/LETTERSPECS", sym);
+        let dir = format!("/SYM/SYM{sym}/LETTERSPECS");
 
         sym_files.append(
             &mut get_files(&session, &dir, |f| {
@@ -182,14 +205,14 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
     }
 
     // Todo: implement a better way to wait for job completion
-    if !files_found.is_empty() {
-        debug!("Waiting 1 hour for batch job to complete.");
-        tokio::time::sleep(Duration::from_secs(HOUR)).await; //
-    }
+    // if !files_found.is_empty() {
+    //     debug!("Waiting 1 hour for batch job to complete.");
+    //     tokio::time::sleep(Duration::from_secs(HOUR)).await; //
+    // }
 
     trace!("{files_found:#?}");
     // Download files asyncronously from remote.
-    // Retries downloads once.
+    // Retries the downloads once.
     //let mut set = JoinSet::new();
     let mut results = Vec::new();
     for file in &files_found {
@@ -253,6 +276,7 @@ async fn process(config: &Config, cli: &CLI) -> anyhow::Result<bool> {
                 debug!("Moving {}", file.local_path);
                 moved.push(file.local_path.clone());
                 let mut file_destination = config.destination_path.clone();
+
                 // These files hit length limits for converting to letter files
                 // so, we'll rename to the expected format here
                 if file.file_name == *"Episys_Database__Extract_Stats" {
@@ -331,7 +355,7 @@ async fn connect(config: &Config, host: &String) -> anyhow::Result<SftpSession> 
                 trace!("Keyboard authentication successful");
                 break;
             }
-            KeyboardInteractiveAuthResponse::Failure => {
+            KeyboardInteractiveAuthResponse::Failure { .. } => {
                 error!("Keyboard authentication failure");
                 return Err(russh::Error::NotAuthenticated.into());
             }
@@ -378,18 +402,12 @@ where
         HOUR + 1800
     };
 
-    for entry in session
-        .read_dir(dir)
-        .await?
-        .into_iter()
-        .filter(filter)
-        .filter(|f| {
-            f.metadata().modified().unwrap()
-                > SystemTime::now()
-                    .checked_sub(Duration::from_secs(file_age))
-                    .unwrap()
-        })
-    {
+    for entry in session.read_dir(dir).await?.filter(filter).filter(|f| {
+        f.metadata().modified().unwrap()
+            > SystemTime::now()
+                .checked_sub(Duration::from_secs(file_age))
+                .unwrap()
+    }) {
         debug!("file in dir: {dir} {:?}", entry.file_name());
 
         if entry.file_type().is_dir() {
@@ -411,15 +429,14 @@ where
 
 struct Client {}
 
-#[async_trait]
 impl client::Handler for Client {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        _server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        info!("check_server_key: {:?}", server_public_key);
+        //info!("check_server_key: {:?}", server_public_key);
         Ok(true)
     }
 
@@ -431,135 +448,6 @@ impl client::Handler for Client {
     ) -> Result<(), Self::Error> {
         //trace!("data on channel {:?}: {}", channel, data.len());
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ExtractFile {
-    sym: u16,
-    sym_path: String,
-    file_name: String,
-    local_path: String,
-    is_empty: bool,
-}
-
-impl ExtractFile {
-    fn new(sym: u16, sym_path: String, file_name: String, local_path: String) -> Self {
-        ExtractFile {
-            sym,
-            sym_path,
-            file_name,
-            local_path,
-            is_empty: false,
-        }
-    }
-
-    async fn download(self, session: Arc<SftpSession>) -> anyhow::Result<(String, String, bool)> {
-        let local_dir = format!(r#".\extracts\{}"#, self.sym);
-        let local_path = format!("{}\\{}", local_dir, self.file_name);
-
-        debug!(
-            "Downloading {} from {} to {}",
-            self.file_name, self.sym_path, local_path
-        );
-
-        if !self.local_path.is_empty() {
-            warn!("File '{}' already downloaded!", self.file_name);
-            return Ok((self.file_name, local_path, self.is_empty));
-        }
-
-        if !Path::new(&local_dir).exists() {
-            debug!(
-                "local '{}' directory does not exist. Creating now.",
-                local_dir
-            );
-            fs::create_dir_all(&local_dir)
-                .await
-                .context(format!("Failed to create extract dir {local_dir}"))?;
-        }
-
-        if fs::try_exists(&local_path).await.context(format!(
-            "Failed to check if local file '{local_path}' exists."
-        ))? {
-            if fs::read_to_string(&local_path)
-                .await
-                .context(format!(
-                    "Failed to check if local file '{local_path}' was empty."
-                ))?
-                .is_empty()
-                && !self.is_empty
-            {
-                warn!(
-                    "Empty file '{}' exists on local disk at '{}'. Overwriting...",
-                    self.file_name, local_path
-                );
-                fs::remove_file(&local_path)
-                    .await
-                    .context(format!("Failed to overwrite empty local file {local_path}"))?;
-            } else {
-                debug!(
-                    "File '{}' exists on local disk at '{}'. Skipping.",
-                    self.file_name, local_path
-                );
-
-                return Ok((self.file_name, local_path, self.is_empty));
-            }
-        } else {
-            debug!("Creating local file {}", local_path);
-            fs::File::create_new(&local_path)
-                .await
-                .context(format!("Failed to create {local_path}"))?;
-        }
-
-        let mut local_md5 = md5::Context::new();
-        let mut remote_md5 = md5::Context::new();
-
-        debug!("Reading {} from remote directory", self.file_name);
-        let data_len = session
-            .metadata(&self.sym_path)
-            .await
-            .context(format!("Could not read file len for {}", self.sym_path))?;
-        let mut sftp_data = session.read(&self.sym_path).await.context(format!(
-            "Failed to read data from remote directory for {}",
-            self.sym_path
-        ))?;
-        while sftp_data.len() < data_len.len().try_into().unwrap() {
-            warn!("sftp_data too short. Redownloading.");
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            sftp_data = session.read(&self.sym_path).await.context(format!(
-                "Failed to read data from remote directory for {}",
-                self.sym_path
-            ))?;
-        }
-        let sftp_data_empty = sftp_data.is_empty();
-        let data = String::from_utf8(sftp_data).context(format!(
-            "Could not convert remote data for '{}' to utf8",
-            self.sym_path
-        ))?;
-        let data = data.replace('\n', "\r\n");
-        remote_md5.consume(&data);
-
-        debug!("Writing {} to local file at {}", self.file_name, local_path);
-        fs::write(&local_path, data).await.context(format!(
-            "Could not write local file '{local_path}' with remote data."
-        ))?;
-
-        let local_file_contents = fs::read_to_string(&local_path).await.context(format!(
-            "Could not read local file '{local_path}' back to check validity"
-        ))?;
-        local_md5.consume(&local_file_contents);
-
-        let remote_check = remote_md5.compute();
-        let local_check = local_md5.compute();
-        if remote_check != local_check {
-            error!("File checksums do not match!");
-            fs::remove_file(&local_path).await.context(format!(
-                "Could not remove file with invalid checksum {local_path}"
-            ))?;
-            return Err(std::io::Error::last_os_error().into());
-        }
-
-        return Ok((self.file_name, local_path, sftp_data_empty));
     }
 }
 
