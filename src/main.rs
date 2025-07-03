@@ -2,6 +2,7 @@ mod config;
 mod extract_file;
 
 use std::{
+    env,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
@@ -20,6 +21,7 @@ use russh::{
 };
 use russh_sftp::client::{fs::DirEntry, SftpSession};
 use time::{macros::format_description, UtcOffset};
+use tokio::runtime::Handle;
 use tracing::{debug, error, trace, warn, Level};
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::layer::SubscriberExt;
@@ -27,22 +29,24 @@ use tracing_subscriber::{fmt, Layer};
 
 #[derive(Parser, Debug)]
 struct Cli {
-    #[arg(long, action = ArgAction::SetTrue)]
+    #[arg(long, action = ArgAction::SetTrue, default_value_t = true)]
     stdout: bool,
 
-    #[arg(short, long, default_value_t = Level::WARN)]
+    #[arg(short, long, default_value_t = Level::TRACE)]
     log: Level,
 
     #[arg(long, default_value_t = String::new())]
     host: String,
 
     #[arg(long, action = ArgAction::SetTrue)]
-    service: bool,
+    cli: bool,
 
     #[arg(long, action = ArgAction::SetTrue)]
     install: bool,
     #[arg(long, action = ArgAction::SetTrue)]
     uninstall: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    reinstall: bool,
 }
 
 const DAY: u64 = 86400;
@@ -51,12 +55,13 @@ const HOUR: u64 = 3600;
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let _config = Config::new();
 
     let timer_format =
         format_description!("[year]-[month]-[day] [hour]:[minute]:[second] [period]");
     let timer = fmt::time::OffsetTime::new(UtcOffset::current_local_offset()?, timer_format);
-    #[allow(unused)]
-    let appender = tracing_appender::rolling::daily("./logs", "log_test.log");
+
+    let appender = tracing_appender::rolling::daily(r#".\logs"#, "log_test.log");
     let (non_blocking_file, _guard) = tracing_appender::non_blocking(appender);
 
     let file_log = tracing_subscriber::fmt::layer()
@@ -81,67 +86,89 @@ pub async fn main() -> anyhow::Result<()> {
         .with(file_log)
         .with(console_log);
     tracing::subscriber::set_global_default(logging).expect("Unable to set up logging");
-    trace!("Startup complete");
+    trace!(
+        "Startup complete in {}",
+        env::current_dir().unwrap_or(PathBuf::from("\\?")).display()
+    );
 
     trace!("Collecting configuration");
 
     if cli.install {
-        let bin_path = std::env::current_exe()
-            .context("Couldn't get executable path.")?
-            .as_path()
-            .canonicalize()
-            .context("Couldn't get executable path.")?;
-        // let bin_path = bin_path.to_str();
-        // if bin_path.is_none() {
-        //     return Err(anyhow!("Couldn't get executable path."));
-        // }
-        // let bin_path = bin_path.unwrap();
-        // println!("{}", &(&bin_path)[4..]);
-        // return Ok(());
-        // let bin_path = &bin_path[4..];
-
-        let status = Command::new("sc.exe")
-            .arg("create")
-            .arg("ARCU PCCU Extract Downloader")
-            .arg("binPath=".to_owned())
-            .arg(bin_path)
-            .status()
-            .context("Error installing service")?;
-        if !status.success() {
-            return Err(anyhow!(
-                "Could not install service: {}",
-                status.code().unwrap_or(-99)
-            ));
-        }
-        return Ok(());
+        return install();
     }
     if cli.uninstall {
-        let status = Command::new("sc.exe")
-            .arg("delete")
-            .arg("ARCU PCCU Extract Downloader")
-            .status()
-            .context("Error uninstalling service")?;
-        if !status.success() {
-            return Err(anyhow!(
-                "Could not uninstall service: {}",
-                status.code().unwrap_or(-99)
-            ));
-        }
-        return Ok(());
+        return uninstall();
+    }
+    if cli.reinstall {
+        uninstall()?;
+        return install();
     }
 
-    if cli.service {
+    if !cli.cli {
+        let handle = Handle::current();
         windows_services::Service::new().can_stop().run(|command| {
             info!("Windows Service Command: {command:#?}");
-            tokio::task::spawn_blocking(async || run().await);
+            match command {
+                windows_services::Command::Start => {
+                    handle.spawn(run());
+                }
+                _ => {}
+            }
         })
-    } else {
-        run().await
     }
+    run().await
+}
+
+fn install() -> Result<()> {
+    let bin_path = std::env::current_exe()
+        .context("Couldn't get executable path.")?
+        .as_path()
+        .canonicalize()
+        .context("Couldn't get executable path.")?;
+    // let bin_path = bin_path.to_str();
+    // if bin_path.is_none() {
+    //     return Err(anyhow!("Couldn't get executable path."));
+    // }
+    // let bin_path = bin_path.unwrap();
+    // println!("{}", &(&bin_path)[4..]);
+    // return Ok(());
+    // let bin_path = &bin_path[4..];
+
+    let status = Command::new("sc.exe")
+        .arg("create")
+        .arg("ARCU PCCU Extract Downloader")
+        .arg("binPath=".to_owned())
+        .arg(bin_path)
+        .status()
+        .context("Error installing service")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "Could not install service: {}",
+            status.code().unwrap_or(-99)
+        ));
+    }
+    return Ok(());
+}
+
+fn uninstall() -> Result<()> {
+    let status = Command::new("sc.exe")
+        .arg("delete")
+        .arg("ARCU PCCU Extract Downloader")
+        .status()
+        .context("Error uninstalling service")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "Could not uninstall service: {}",
+            status.code().unwrap_or(-99)
+        ));
+    }
+    return Ok(());
 }
 
 async fn run() -> anyhow::Result<()> {
+    info!("Running main loop...");
     let (config, cli) = (Config::new(), Cli::parse());
+
     loop {
         let mut done = false;
         match process(&config, &cli).await {
@@ -149,22 +176,25 @@ async fn run() -> anyhow::Result<()> {
             Err(e) => error!("Error processing {e}"),
         }
 
+        let mut sleep_time = Duration::from_secs(60);
+
         if cfg!(debug_assertions) {
             debug!("Exiting due to running in debug. If this is not intended, compile with 'cargo build --release'");
             break Ok(());
         }
         if done {
             debug!(
-                "Full completion of processing detected. Waiting one hour before checking for new files."
+                "Full completion of processing detected. Waiting 90 minutes before checking for new files."
             );
-            tokio::time::sleep(Duration::from_secs(HOUR + 1800)).await;
-        } else {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            sleep_time = Duration::from_secs(HOUR + (HOUR / 2));
         }
+
+        tokio::time::sleep(sleep_time).await;
     }
 }
 
 async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
+    info!("Processing...");
     let session = Arc::from(connect(config, &cli.host).await?);
     let mut last_file = None;
 
