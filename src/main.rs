@@ -5,6 +5,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     sync::Arc,
+    sync::RwLock,
     time::{Duration, SystemTime},
 };
 
@@ -26,6 +27,7 @@ use tracing::{debug, error, trace, warn, Level};
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{fmt, Layer};
+use windows_services::Service;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -106,18 +108,34 @@ pub async fn main() -> anyhow::Result<()> {
 
     if !cli.cli {
         let handle = Handle::current();
-        windows_services::Service::new().can_stop().run(|command| {
-            info!("Windows Service Command: {command:#?}");
-            match command {
-                windows_services::Command::Start => {
-                    handle.spawn(run());
+        let serv = Arc::new(RwLock::new(Service::new()));
+        let service = Arc::clone(&serv);
+        serv.write()
+            .expect("Could not get write for Service")
+            .can_stop()
+            .run(move |_, command| {
+                info!("Windows Service Command: {command:#?}");
+
+                let service = Arc::clone(&service);
+                if command == windows_services::Command::Start {
+                    // Todo: Determine how to get around the read() blocking from the above write() call
+
+                    handle.spawn(run(async move || {
+                        debug!("Starting callback");
+                        let s = service.read().expect("Could not get read for Service");
+
+                        s.command(windows_services::Command::Stop);
+                        debug!("{:?}", s.state())
+                    }));
                 }
-                _ => {}
-            }
-        })
+            })
+            .expect("Cannot run service");
+        return Ok(());
     }
-    run().await
+    run(async || {}).await
 }
+
+const SERVICE_NAME: &str = "ARCU PCCU Extract Downloader";
 
 fn install() -> Result<()> {
     let bin_path = std::env::current_exe()
@@ -125,19 +143,11 @@ fn install() -> Result<()> {
         .as_path()
         .canonicalize()
         .context("Couldn't get executable path.")?;
-    // let bin_path = bin_path.to_str();
-    // if bin_path.is_none() {
-    //     return Err(anyhow!("Couldn't get executable path."));
-    // }
-    // let bin_path = bin_path.unwrap();
-    // println!("{}", &(&bin_path)[4..]);
-    // return Ok(());
-    // let bin_path = &bin_path[4..];
 
     let status = Command::new("sc.exe")
         .arg("create")
-        .arg("ARCU PCCU Extract Downloader")
-        .arg("binPath=".to_owned())
+        .arg(SERVICE_NAME)
+        .arg("binPath=")
         .arg(bin_path)
         .status()
         .context("Error installing service")?;
@@ -147,13 +157,13 @@ fn install() -> Result<()> {
             status.code().unwrap_or(-99)
         ));
     }
-    return Ok(());
+    Ok(())
 }
 
 fn uninstall() -> Result<()> {
     let status = Command::new("sc.exe")
         .arg("delete")
-        .arg("ARCU PCCU Extract Downloader")
+        .arg(SERVICE_NAME)
         .status()
         .context("Error uninstalling service")?;
     if !status.success() {
@@ -162,14 +172,20 @@ fn uninstall() -> Result<()> {
             status.code().unwrap_or(-99)
         ));
     }
-    return Ok(());
+    Ok(())
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run<F>(callback: F) -> anyhow::Result<()>
+where
+    F: AsyncFnOnce() -> (),
+{
     info!("Running main loop...");
     let (config, cli) = (Config::new(), Cli::parse());
 
     loop {
+        if cfg!(debug_assertions) {
+            break;
+        }
         let mut done = false;
         match process(&config, &cli).await {
             Ok(is_done) => done = is_done,
@@ -180,7 +196,7 @@ async fn run() -> anyhow::Result<()> {
 
         if cfg!(debug_assertions) {
             debug!("Exiting due to running in debug. If this is not intended, compile with 'cargo build --release'");
-            break Ok(());
+            break;
         }
         if done {
             debug!(
@@ -191,6 +207,10 @@ async fn run() -> anyhow::Result<()> {
 
         tokio::time::sleep(sleep_time).await;
     }
+
+    debug!("Main run loop ended, running callback");
+    callback().await;
+    Ok(())
 }
 
 async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
@@ -295,7 +315,7 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
         }
     }
 
-    if last_file.is_some() {
+    if let Some(last_file) = last_file {
         debug!("Last file found. Moving other files.");
         let mut moved = Vec::new();
         for file in files_found
@@ -329,7 +349,7 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
         }
 
         debug!("Moving last file.");
-        let last_file = files_found.get(last_file.unwrap()).unwrap();
+        let last_file = files_found.get(last_file).unwrap();
         let mut file_destination = config.destination_path.clone();
         file_destination.push(&last_file.file_name);
         std::fs::rename(&last_file.local_path, file_destination)?;
@@ -531,8 +551,8 @@ fn combine_datasupp(files: Vec<&ExtractFile>, status: &mut bool) -> Result<Extra
 
             let (mut label, mut count) = ("", "");
             let split = line.split_once(':');
-            if split.is_some() {
-                (label, count) = split.unwrap();
+            if let Some(split) = split {
+                (label, count) = split;
             }
 
             debug!("{label}, {count}")

@@ -11,10 +11,10 @@ tracing-subscriber = { version = "0.3", features = ["time", "registry"] }
 time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 dotenvy = "0.15"
 dotenvy_macro = "0.15"
-russh =  "^0.53"
+russh =  "^0.54"
 russh-sftp = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal"] }
 anyhow = { version = "1.0.94", features = ["backtrace"] }
 md5 = "0.8.0"
-windows-services = "0.24"
+windows-services = "0.26"
 runas = "1.2.0"
