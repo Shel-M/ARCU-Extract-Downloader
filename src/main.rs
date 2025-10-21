@@ -1,36 +1,40 @@
 mod config;
 mod extract_file;
+mod service;
 
 use std::{
     env,
+    ffi::OsString,
     path::{Path, PathBuf},
-    sync::Arc,
-    sync::RwLock,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
 
 use crate::config::Config;
 use crate::extract_file::ExtractFile;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
-use runas::Command;
 use russh::{
     client::{self, KeyboardInteractiveAuthResponse},
     keys::PublicKey,
     ChannelId,
 };
 use russh_sftp::client::{fs::DirEntry, SftpSession};
-use time::{macros::format_description, UtcOffset};
-use tokio::runtime::Handle;
+use time::{format_description::BorrowedFormatItem, macros::format_description, UtcOffset};
+use tokio::runtime::{Builder, Handle};
+use tokio::sync::mpsc::Receiver;
 use tracing::{debug, error, trace, warn, Level};
 use tracing::{info, level_filters::LevelFilter};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::{fmt, Layer};
-use windows_services::Service;
+use tracing_subscriber::{fmt::time::OffsetTime, layer::SubscriberExt};
+use tracing_subscriber::{
+    fmt::{self},
+    Layer,
+};
+use windows_service::{define_windows_service, service_dispatcher};
 
 #[derive(Parser, Debug)]
-struct Cli {
+pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue, default_value_t = true)]
     stdout: bool,
 
@@ -54,29 +58,41 @@ struct Cli {
 const DAY: u64 = 86400;
 const HOUR: u64 = 3600;
 
+pub static TIMER: OnceLock<OffsetTime<&[BorrowedFormatItem<'_>]>> = OnceLock::new();
+
+define_windows_service!(ffi_service_main, service_main);
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
+    // let cli = crate::setup().expect("Could not set up application");
     let cli = Cli::parse();
     let _config = Config::new();
 
-    let timer_format =
-        format_description!("[year]-[month]-[day] [hour]:[minute]:[second] [period]");
-    let timer = fmt::time::OffsetTime::new(UtcOffset::current_local_offset()?, timer_format);
+    let timer = TIMER.get_or_init(|| {
+        let timer_format =
+            format_description!("[year]-[month]-[day] [hour]:[minute]:[second] [period]");
+        OffsetTime::new(
+            UtcOffset::current_local_offset().expect("Could not get local timezone"),
+            timer_format,
+        )
+    });
 
-    let appender = tracing_appender::rolling::daily(r#".\logs"#, "log_test.log");
+    let appender =
+        tracing_appender::rolling::daily(r#"C:\dev\extract-downloader\logs"#, "log_test.log");
     let (non_blocking_file, _guard) = tracing_appender::non_blocking(appender);
 
-    let file_log = tracing_subscriber::fmt::layer()
-        .with_timer(timer.clone())
+    let file_log = fmt::layer()
+        .with_timer(timer)
         .with_level(true)
         .with_writer(non_blocking_file)
         .with_ansi(false)
         .with_filter(LevelFilter::from_level(cli.log));
+    let logger = tracing_subscriber::registry();
+    let logger = logger.with(file_log);
 
     let console_log = if cli.stdout {
         Some(
-            tracing_subscriber::fmt::layer()
-                .with_timer(timer)
+            fmt::layer()
+                .with_timer(TIMER.get().unwrap())
                 .with_ansi(false)
                 .with_filter(LevelFilter::from_level(cli.log)),
         )
@@ -84,98 +100,52 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let logging = tracing_subscriber::registry()
-        .with(file_log)
-        .with(console_log);
+    let logging = logger.with(console_log);
     tracing::subscriber::set_global_default(logging).expect("Unable to set up logging");
     trace!(
         "Startup complete in {}",
         env::current_dir().unwrap_or(PathBuf::from("\\?")).display()
     );
 
-    trace!("Collecting configuration");
+    trace!("Running as main (2)");
 
     if cli.install {
-        return install();
+        return service::install();
     }
     if cli.uninstall {
-        return uninstall();
+        return service::uninstall();
     }
     if cli.reinstall {
-        uninstall()?;
-        return install();
+        return service::reinstall();
     }
 
-    if !cli.cli {
-        let handle = Handle::current();
-        let serv = Arc::new(RwLock::new(Service::new()));
-        let service = Arc::clone(&serv);
-        serv.write()
-            .expect("Could not get write for Service")
-            .can_stop()
-            .run(move |_, command| {
-                info!("Windows Service Command: {command:#?}");
+    // if cli.cli {
+    //     return run(async || {}, None).await;
+    // }
 
-                let service = Arc::clone(&service);
-                if command == windows_services::Command::Start {
-                    // Todo: Determine how to get around the read() blocking from the above write() call
-
-                    handle.spawn(run(async move || {
-                        debug!("Starting callback");
-                        let s = service.read().expect("Could not get read for Service");
-
-                        s.command(windows_services::Command::Stop);
-                        debug!("{:?}", s.state())
-                    }));
-                }
-            })
-            .expect("Cannot run service");
-        return Ok(());
-    }
-    run(async || {}).await
-}
-
-const SERVICE_NAME: &str = "ARCU PCCU Extract Downloader";
-
-fn install() -> Result<()> {
-    let bin_path = std::env::current_exe()
-        .context("Couldn't get executable path.")?
-        .as_path()
-        .canonicalize()
-        .context("Couldn't get executable path.")?;
-
-    let status = Command::new("sc.exe")
-        .arg("create")
-        .arg(SERVICE_NAME)
-        .arg("binPath=")
-        .arg(bin_path)
-        .status()
-        .context("Error installing service")?;
-    if !status.success() {
-        return Err(anyhow!(
-            "Could not install service: {}",
-            status.code().unwrap_or(-99)
-        ));
-    }
+    if let Err(e) = service_dispatcher::start(service::SERVICE_NAME, ffi_service_main) {
+        error!("Error running service: {e}");
+    };
     Ok(())
 }
 
-fn uninstall() -> Result<()> {
-    let status = Command::new("sc.exe")
-        .arg("delete")
-        .arg(SERVICE_NAME)
-        .status()
-        .context("Error uninstalling service")?;
-    if !status.success() {
-        return Err(anyhow!(
-            "Could not uninstall service: {}",
-            status.code().unwrap_or(-99)
-        ));
+fn service_main(_arguments: Vec<OsString>) {
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_io()
+        .enable_time()
+        .build()
+        .unwrap();
+    trace!("Running as service");
+    // let handle = Handle::current();
+    // trace!("{:#?}", handle.metrics());
+
+    if let Err(e) = runtime.block_on(service::run_service()) {
+        error!("Service failed: {:?}", e);
     }
-    Ok(())
 }
 
-async fn run<F>(callback: F) -> anyhow::Result<()>
+pub async fn run<F>(callback: F, mut shutdown_channel: Option<Receiver<()>>) -> anyhow::Result<()>
 where
     F: AsyncFnOnce() -> (),
 {
@@ -183,9 +153,11 @@ where
     let (config, cli) = (Config::new(), Cli::parse());
 
     loop {
-        if cfg!(debug_assertions) {
-            break;
-        }
+        // // Disable run loop for testing. Todo: Remove
+        // if cfg!(debug_assertions) {
+        //     break;
+        // }
+
         let mut done = false;
         match process(&config, &cli).await {
             Ok(is_done) => done = is_done,
@@ -205,7 +177,18 @@ where
             sleep_time = Duration::from_secs(HOUR + (HOUR / 2));
         }
 
-        tokio::time::sleep(sleep_time).await;
+        if let Some(ref mut rx) = shutdown_channel {
+            tokio::select! {
+                _ = rx.recv() => {
+                    debug!("Received shutdown signal.");
+                    break;
+                }
+                _ = tokio::time::sleep(sleep_time) => {}
+
+            }
+        } else {
+            tokio::time::sleep(sleep_time).await;
+        }
     }
 
     debug!("Main run loop ended, running callback");
