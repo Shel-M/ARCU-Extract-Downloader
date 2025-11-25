@@ -4,17 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = { version = "1.0.94", features = ["backtrace"] }
 clap = { version = "4", features = ["derive"] } 
+dotenvy = "0.15"
+dotenvy_macro = "0.15"
+md5 = "0.8.0"
+russh = "=0.54.5"
+russh-sftp = "2.0"
+serde = { version = "1", features = ["derive"] }
+time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "io-std"] }
+toml = "0.9.8"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["time", "registry"] }
-time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
-dotenvy = "0.15"
-dotenvy_macro = "0.15"
-russh =  "^0.54"
-russh-sftp = "2.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal"] }
-anyhow = { version = "1.0.94", features = ["backtrace"] }
-md5 = "0.8.0"
 windows-service = "0.8"
 windows-sys = { version = "0.61", features = [ "Win32_Foundation" ] }

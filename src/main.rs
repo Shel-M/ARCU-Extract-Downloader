@@ -1,5 +1,7 @@
+mod clients;
 mod config;
 mod extract_file;
+mod extractor;
 mod service;
 
 use std::{
@@ -7,22 +9,20 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
+use crate::clients::Client;
 use crate::config::Config;
 use crate::extract_file::ExtractFile;
+use crate::extractor::Extractor;
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
-use russh::{
-    client::{self, KeyboardInteractiveAuthResponse},
-    keys::PublicKey,
-    ChannelId,
-};
+use russh::client::KeyboardInteractiveAuthResponse;
 use russh_sftp::client::{fs::DirEntry, SftpSession};
 use time::{format_description::BorrowedFormatItem, macros::format_description, UtcOffset};
-use tokio::runtime::{Builder, Handle};
+use tokio::runtime::Builder;
 use tokio::sync::mpsc::Receiver;
 use tracing::{debug, error, trace, warn, Level};
 use tracing::{info, level_filters::LevelFilter};
@@ -41,9 +41,6 @@ pub struct Cli {
     #[arg(short, long, default_value_t = Level::TRACE)]
     log: Level,
 
-    #[arg(long, default_value_t = String::new())]
-    host: String,
-
     #[arg(long, action = ArgAction::SetTrue)]
     cli: bool,
 
@@ -53,16 +50,29 @@ pub struct Cli {
     uninstall: bool,
     #[arg(long, action = ArgAction::SetTrue)]
     reinstall: bool,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    sync: bool,
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_check: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    experimental: bool,
 }
 
 const DAY: u64 = 86400;
 const HOUR: u64 = 3600;
+const HALF_HOUR: u64 = 1800;
 
 pub static TIMER: OnceLock<OffsetTime<&[BorrowedFormatItem<'_>]>> = OnceLock::new();
+pub static START: OnceLock<Instant> = OnceLock::new();
 
 define_windows_service!(ffi_service_main, service_main);
-#[tokio::main]
-pub async fn main() -> anyhow::Result<()> {
+pub fn main() -> anyhow::Result<()> {
+    let start_time = START.get_or_init(Instant::now);
+
     // let cli = crate::setup().expect("Could not set up application");
     let cli = Cli::parse();
     let _config = Config::new();
@@ -109,6 +119,12 @@ pub async fn main() -> anyhow::Result<()> {
 
     trace!("Running as main (2)");
 
+    #[cfg(debug_assertions)]
+    {
+        _ = std::fs::remove_dir_all(r#".\extracts\"#);
+        // _ = std::fs::remove_dir_all(&_config.destination_path);
+    }
+
     if cli.install {
         return service::install();
     }
@@ -119,9 +135,37 @@ pub async fn main() -> anyhow::Result<()> {
         return service::reinstall();
     }
 
-    // if cli.cli {
-    //     return run(async || {}, None).await;
-    // }
+    if cli.cli {
+        let runtime = Builder::new_multi_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        trace!("Running as cli: {runtime:#?}");
+
+        runtime.spawn(async {
+            loop {
+                let runtime = tokio::runtime::Handle::current().metrics();
+                trace!(
+                    "{} : {}",
+                    runtime.num_alive_tasks(),
+                    runtime.global_queue_depth()
+                );
+                // trace!("{}", runtime.with_current_subscriber)
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let ret = runtime.block_on(run(async || {}, None));
+
+        let stop_time = Instant::now();
+        trace!(
+            "Ran for {}",
+            stop_time.duration_since(*start_time).as_secs_f64()
+        );
+
+        return ret;
+    }
 
     if let Err(e) = service_dispatcher::start(service::SERVICE_NAME, ffi_service_main) {
         error!("Error running service: {e}");
@@ -131,14 +175,11 @@ pub async fn main() -> anyhow::Result<()> {
 
 fn service_main(_arguments: Vec<OsString>) {
     let runtime = Builder::new_multi_thread()
-        .worker_threads(4)
         .enable_io()
         .enable_time()
         .build()
         .unwrap();
     trace!("Running as service");
-    // let handle = Handle::current();
-    // trace!("{:#?}", handle.metrics());
 
     if let Err(e) = runtime.block_on(service::run_service()) {
         error!("Service failed: {:?}", e);
@@ -152,53 +193,64 @@ where
     info!("Running main loop...");
     let (config, cli) = (Config::new(), Cli::parse());
 
-    loop {
-        // // Disable run loop for testing. Todo: Remove
-        // if cfg!(debug_assertions) {
-        //     break;
-        // }
-
-        let mut done = false;
-        match process(&config, &cli).await {
-            Ok(is_done) => done = is_done,
-            Err(e) => error!("Error processing {e}"),
-        }
-
-        let mut sleep_time = Duration::from_secs(60);
-
-        if cfg!(debug_assertions) {
-            debug!("Exiting due to running in debug. If this is not intended, compile with 'cargo build --release'");
-            break;
-        }
-        if done {
-            debug!(
-                "Full completion of processing detected. Waiting 90 minutes before checking for new files."
-            );
-            sleep_time = Duration::from_secs(HOUR + (HOUR / 2));
-        }
-
-        if let Some(ref mut rx) = shutdown_channel {
-            tokio::select! {
-                _ = rx.recv() => {
-                    debug!("Received shutdown signal.");
-                    break;
-                }
-                _ = tokio::time::sleep(sleep_time) => {}
-
+    if cli.experimental {
+        let mut extractor = Extractor::new(Config::new());
+        extractor.syncronous(cli.sync);
+        extractor.queues(cli.threads);
+        extractor.process().await.expect("Extractor failed"); //?;
+    } else {
+        loop {
+            let mut done = false;
+            match process(&config, &cli).await {
+                Ok(is_done) => done = is_done,
+                Err(e) => error!("Error processing {e}"),
             }
-        } else {
-            tokio::time::sleep(sleep_time).await;
+
+            let mut sleep_time = Duration::from_secs(60);
+
+            if cfg!(debug_assertions) {
+                debug!("Exiting due to running in debug. If this is not intended, compile with 'cargo build --release'");
+                break;
+            }
+            if done {
+                debug!(
+                "Full completion of processing detected. Waiting 90 minutes before checking for new files."
+
+            );
+                sleep_time = Duration::from_secs(HOUR + (HOUR / 2));
+            }
+
+            if let Some(ref mut rx) = shutdown_channel {
+                tokio::select! {
+                    _ = rx.recv() => {
+                        debug!("Received shutdown signal.");
+                        break;
+                    }
+                    _ = tokio::time::sleep(sleep_time) => ()
+
+                }
+            } else {
+                tokio::time::sleep(sleep_time).await;
+            }
         }
+
+        debug!("Main run loop ended, running callback");
+        callback().await;
     }
 
-    debug!("Main run loop ended, running callback");
-    callback().await;
+    let stop_time = Instant::now();
+    let start_time = START.get().unwrap();
+    trace!(
+        "Ran for {}",
+        stop_time.duration_since(*start_time).as_secs_f64()
+    );
     Ok(())
 }
 
 async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
     info!("Processing...");
-    let session = Arc::from(connect(config, &cli.host).await?);
+    let session = Arc::from(connect(config).await?);
+    // session.set_timeout(60).await;
     let mut last_file = None;
 
     let mut files_found: Vec<ExtractFile> = Vec::new();
@@ -214,7 +266,7 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
                     && (f.file_name().starts_with("EXTRACT.")
                         || f.file_name().starts_with("FMT.")
                         || f.file_name().starts_with("MACRO.")
-                        || f.file_name() == ("CD_Trial_Bal_for_")
+                        || f.file_name() == "CD_Trial_Bal_for_"
                         || f.file_name() == "Episys_DataSupp_Statistics.txt"
                         || f.file_name() == "Episys_Database__Extract_Stats"
                         || f.file_name() == "EXTRACT_LASTFILE.txt")
@@ -238,20 +290,34 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
     }
 
     // Todo: implement a better way to wait for job completion
-    // if !files_found.is_empty() {
-    //     debug!("Waiting 1 hour for batch job to complete.");
-    //     tokio::time::sleep(Duration::from_secs(HOUR)).await; //
-    // }
+    if !files_found.is_empty() && !cfg!(debug_assertions) {
+        debug!("Waiting 1 hour for batch job to complete.");
+        tokio::time::sleep(Duration::from_secs(HOUR)).await; //
+    }
 
     trace!("{files_found:#?}");
-    // Download files asyncronously from remote.
-    // Retries the downloads once.
-    //let mut set = JoinSet::new();
-    let mut results = Vec::new();
-    for file in &files_found {
-        results.push(file.clone().download(session.clone()).await);
-    }
-    //let results = set.join_all().await;
+
+    // Todo: adjust this to a task queue over the number of available workers minus one.
+    // The old method of downloading every file synchonously was prone to system io errors.
+
+    let results = if cli.sync {
+        trace!("Running in sync mode");
+        let results = Vec::new();
+        for file in &files_found {
+            let mut results = Vec::new();
+            results.push(file.clone().download(session.clone()).await);
+        }
+        results
+    } else {
+        // Download files asyncronously from remote.
+        // Retries the downloads once.
+        trace!("Running in async mode");
+        let mut set = tokio::task::JoinSet::new();
+        for file in &files_found {
+            set.spawn(file.clone().download(session.clone()));
+        }
+        set.join_all().await
+    };
 
     for res in results {
         let res = match res {
@@ -262,14 +328,46 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
             }
         };
         for f in files_found.iter_mut().filter(|f| f.file_name == res.0) {
+            trace!("Saving success results for '{}'", f.file_name);
             f.local_path = res.1.clone();
-            f.is_empty = res.2;
+            f.is_remote_empty = res.2;
+            f.download_error = false;
         }
     }
-    for file in files_found.iter_mut().filter(|f| f.local_path.is_empty()) {
-        warn!("{0} Failed to download. Retrying...", file.file_name);
-        let result = file.clone().download(session.clone()).await?;
-        file.local_path = result.1;
+    // for file in files_found
+    //     .iter_mut()
+    //     .filter(|f| f.local_path.is_empty() || f.download_error)
+    // {
+    //     warn!("{0} Failed to download. Retrying...", file.file_name);
+    //     let result = file.clone().download(session.clone()).await?;
+    //     file.local_path = result.1;
+    // }
+    let while_limit = 50;
+    let mut while_count = 0;
+    while files_found.iter().any(|f| f.download_error) {
+        while_count += 1;
+        if while_count > while_limit {
+            break;
+        }
+        for file in files_found
+            .iter_mut()
+            .filter(|f| f.local_path.is_empty() || f.download_error)
+        {
+            warn!("{0} Failed to download. Retrying...", file.file_name);
+            file.is_remote_empty = false;
+            let result = match file.clone().download(session.clone()).await {
+                Ok(v) => {
+                    file.download_error = false;
+                    v
+                }
+                Err(e) => {
+                    error!("Download error! {e}");
+                    file.download_error = true;
+                    continue;
+                }
+            };
+            file.local_path = result.1;
+        }
     }
     session.close().await?;
 
@@ -300,6 +398,11 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
 
     if let Some(last_file) = last_file {
         debug!("Last file found. Moving other files.");
+        if !std::fs::exists(&config.destination_path)
+            .context("Attempting to verify destination path")?
+        {
+            std::fs::create_dir(&config.destination_path).context("")?;
+        }
         let mut moved = Vec::new();
         for file in files_found
             .iter()
@@ -355,28 +458,13 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-async fn connect(config: &Config, host: &String) -> anyhow::Result<SftpSession> {
-    let host = if !host.is_empty() {
-        if !host.contains(":") {
-            warn!("No port on hostname '{host}'. Defaulting to 22.")
-        }
-        host
-    } else {
-        &config.host.to_string()
-    };
-
-    let host_split = host
-        .split(':')
-        .map(|s| s.to_string())
-        .collect::<Vec<String>>();
-    let host = host_split[0].clone();
-    let port = host_split[1].parse().unwrap_or(22);
-
-    debug!("Connecting to host '{}'", host);
+async fn connect(config: &Config) -> anyhow::Result<SftpSession> {
+    debug!("Connecting to host '{}'", config.host);
     let russh_config = russh::client::Config::default();
 
     let sh = Client {};
-    let mut session = russh::client::connect(Arc::new(russh_config), (host, port), sh).await?;
+    let mut session =
+        russh::client::connect(Arc::new(russh_config), (&*config.host, config.port), sh).await?;
 
     let mut interactive_response = session
         .authenticate_keyboard_interactive_start(config.username.clone(), None)
@@ -432,7 +520,7 @@ where
     let file_age = if cfg!(debug_assertions) {
         DAY
     } else {
-        HOUR + 1800
+        HOUR + HALF_HOUR
     };
 
     for entry in session.read_dir(dir).await?.filter(filter).filter(|f| {
@@ -441,9 +529,8 @@ where
                 .checked_sub(Duration::from_secs(file_age))
                 .unwrap()
     }) {
-        debug!("file in dir: {dir} {:?}", entry.file_name());
-
         if entry.file_type().is_dir() {
+            debug!("dir: {dir} {:?}", entry.file_name());
             let dir = format!("{dir}/{}", entry.file_name());
             for file in session.read_dir(&dir).await? {
                 if !file.file_type().is_dir() {
@@ -453,35 +540,12 @@ where
                 }
             }
         } else {
+            debug!("file in dir: {dir} {:?}", entry.file_name());
             result.push(format!("{dir}/{}", entry.file_name()));
         }
     }
 
     Ok(result)
-}
-
-struct Client {}
-
-impl client::Handler for Client {
-    type Error = anyhow::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &PublicKey,
-    ) -> Result<bool, Self::Error> {
-        //info!("check_server_key: {:?}", server_public_key);
-        Ok(true)
-    }
-
-    async fn data(
-        &mut self,
-        _channel: ChannelId,
-        _data: &[u8],
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        //trace!("data on channel {:?}: {}", channel, data.len());
-        Ok(())
-    }
 }
 
 #[allow(dead_code, unused)] // incomplete function
@@ -547,6 +611,7 @@ fn combine_datasupp(files: Vec<&ExtractFile>, status: &mut bool) -> Result<Extra
         sym_path: String::new(),
         file_name: String::new(),
         local_path: String::new(),
-        is_empty: false,
+        is_remote_empty: false,
+        download_error: false,
     })
 }

@@ -7,6 +7,7 @@ pub struct Config {
     pub username: String,
     pub password: String,
     pub host: String,
+    pub port: u16,
     pub syms: Vec<u16>,
     pub destination_path: PathBuf,
 }
@@ -16,16 +17,22 @@ impl Config {
         let exe_path = env::current_exe().expect("Could not get executable path");
         let mut working_directory = PathBuf::new();
         for comp in exe_path.components() {
-            working_directory = working_directory.join(comp);
-            if comp
+            let comp_str = comp
                 .as_os_str()
                 .to_str()
-                .expect("Could not break down executable path")
-                == "extract-downloader"
-            {
+                .expect("Could not break down executable path");
+
+            if comp_str.ends_with(".exe") {
+                break;
+            }
+
+            working_directory = working_directory.join(comp);
+
+            if comp_str == "extract-downloader" {
                 break;
             }
         }
+        println!("{}", working_directory.display());
         env::set_current_dir(&working_directory).expect("Could not set working directory");
 
         dotenv().ok();
@@ -34,6 +41,14 @@ impl Config {
         if !host.ends_with(":22") && host.contains(':') {
             warn!("Unrecognized port detected. Continuing as configured.")
         }
+
+        let host_split = host.split(':').collect::<Vec<_>>();
+        let host = host_split[0].to_string();
+        let port = if host_split.len() == 2 {
+            host_split[1].parse().unwrap_or(22)
+        } else {
+            22
+        };
 
         let syms = var("SYMS").unwrap().to_string();
         let password = var("SFTP_PASSWORD")
@@ -44,6 +59,7 @@ impl Config {
         Self {
             password,
             host,
+            port,
 
             username: var("SFTP_USERNAME").unwrap().to_string(),
             destination_path: PathBuf::from(var("DESTINATION").unwrap().to_string()),
