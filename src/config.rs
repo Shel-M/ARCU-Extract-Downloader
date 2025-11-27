@@ -1,4 +1,3 @@
-use dotenvy::{dotenv, var};
 use serde::{de, Deserialize};
 use std::{
     env,
@@ -6,7 +5,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
 };
-use tracing::{trace, warn, Level};
+use tracing::Level;
 
 use crate::Cli;
 

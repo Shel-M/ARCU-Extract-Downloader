@@ -6,8 +6,6 @@ edition = "2021"
 [dependencies]
 anyhow = { version = "1.0.94", features = ["backtrace"] }
 clap = { version = "4", features = ["derive"] }
-dotenvy = "0.15"
-dotenvy_macro = "0.15"
 md5 = "0.8.0"
 russh = "=0.54.5"
 russh-sftp = "2.0"
