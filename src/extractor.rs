@@ -49,7 +49,10 @@ impl Extractor {
         self.checksum = checksum
     }
 
-    pub fn queues(&mut self, queue_count: usize) {
+    pub fn queues(&mut self, queue_count: Option<usize>) {
+        let Some(queue_count) = queue_count else {
+            return;
+        };
         if queue_count > 0 {
             self.queue_count = queue_count;
         }
@@ -70,20 +73,20 @@ impl Extractor {
 
         let mut files = Vec::new();
         for sym in &self.config.syms {
-            let local_path = format!(r#".\extracts\{}"#, sym);
+            let local_path = format!(r#".\extracts\{}"#, sym.number);
             if !Path::new(&local_path).exists() {
                 fs::create_dir_all(&local_path)
                     .await
                     .context(format!("Failed to create extract dir {}", local_path))?;
             }
 
-            let dir = format!("/SYM/SYM{sym}/SQLEXTRACT");
-            files.append(&mut self.init_files(*sym, dir, |_| true).await?);
+            let dir = format!("/SYM/SYM{}/SQLEXTRACT", sym.number);
+            files.append(&mut self.init_files(sym.number, dir, |_| true).await?);
 
-            let dir = format!("/SYM/SYM{sym}/LETTERSPECS");
+            let dir = format!("/SYM/SYM{}/LETTERSPECS", sym.number);
             files.append(
                 &mut self
-                    .init_files(*sym, dir, |f| {
+                    .init_files(sym.number, dir, |f| {
                         !f.file_name().contains("DataSupp.")
                             && (f.file_name().starts_with("EXTRACT.")
                                 || f.file_name().starts_with("FMT.")

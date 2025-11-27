@@ -18,19 +18,22 @@ pub struct SftpClient {
 
 impl SftpClient {
     pub async fn connect(config: &Config) -> anyhow::Result<Self> {
-        debug!("Connecting to host '{}'", config.host);
+        debug!("Connecting to host '{}'", config.sftp.hostname);
         let russh_config = russh::client::Config {
             channel_buffer_size: 400,
             ..Default::default()
         };
 
         let sh = Client {};
-        let mut session =
-            russh::client::connect(Arc::new(russh_config), (&*config.host, config.port), sh)
-                .await?;
+        let mut session = russh::client::connect(
+            Arc::new(russh_config),
+            (&*config.sftp.hostname, config.sftp.port),
+            sh,
+        )
+        .await?;
 
         let mut interactive_response = session
-            .authenticate_keyboard_interactive_start(config.username.clone(), None)
+            .authenticate_keyboard_interactive_start(config.sftp.username.clone(), None)
             .await?;
 
         loop {
@@ -53,7 +56,7 @@ impl SftpClient {
                     let resp = prompts
                         .iter()
                         .filter(|p| p.prompt.to_lowercase().contains("password"))
-                        .map(|_| config.password.clone())
+                        .map(|_| config.sftp.password.clone())
                         .collect::<Vec<String>>();
                     interactive_response = session
                         .authenticate_keyboard_interactive_respond(resp)
@@ -99,16 +102,19 @@ pub struct SshClient {
 
 impl SshClient {
     pub async fn connect(config: &Config) -> anyhow::Result<Self> {
-        println!("Connecting to host '{}'", config.host);
+        println!("Connecting to host '{}'", config.sftp.hostname);
         let russh_config = russh::client::Config::default();
 
         let sh = Client {};
-        let mut session =
-            russh::client::connect(Arc::new(russh_config), (&*config.host, config.port), sh)
-                .await?;
+        let mut session = russh::client::connect(
+            Arc::new(russh_config),
+            (&*config.sftp.hostname, config.sftp.port),
+            sh,
+        )
+        .await?;
 
         let mut interactive_response = session
-            .authenticate_keyboard_interactive_start(config.username.clone(), None)
+            .authenticate_keyboard_interactive_start(config.sftp.username.clone(), None)
             .await?;
 
         loop {
@@ -131,7 +137,7 @@ impl SshClient {
                     let resp = prompts
                         .iter()
                         .filter(|p| p.prompt.to_lowercase().contains("password"))
-                        .map(|_| config.password.clone())
+                        .map(|_| config.sftp.password.clone())
                         .collect::<Vec<String>>();
                     interactive_response = session
                         .authenticate_keyboard_interactive_respond(resp)

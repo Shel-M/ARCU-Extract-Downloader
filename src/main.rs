@@ -22,7 +22,7 @@ use clap::{ArgAction, Parser};
 use russh::client::KeyboardInteractiveAuthResponse;
 use russh_sftp::client::{fs::DirEntry, SftpSession};
 use time::{format_description::BorrowedFormatItem, macros::format_description, UtcOffset};
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::Receiver;
 use tracing::{debug, error, trace, warn, Level};
 use tracing::{info, level_filters::LevelFilter};
@@ -34,12 +34,10 @@ use tracing_subscriber::{
 use windows_service::{define_windows_service, service_dispatcher};
 
 #[derive(Parser, Debug)]
+#[command(next_line_help = true)]
 pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue, default_value_t = true)]
     stdout: bool,
-
-    #[arg(short, long, default_value_t = Level::TRACE)]
-    log: Level,
 
     #[arg(long, action = ArgAction::SetTrue)]
     cli: bool,
@@ -51,11 +49,29 @@ pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     reinstall: bool,
 
+    // Config overlay arguments
+    #[arg(long)]
+    destination: Option<PathBuf>,
+    /// Logging level - see "https://docs.rs/tracing-core/latest/src/tracing_core/metadata.rs.html#553" for how this is parsed.  Default: warn
+    #[arg(short, long)]
+    log_level: Option<Level>,
+    /// Number of download queues
+    #[arg(long, short)]
+    queue_count: Option<usize>,
+    #[arg(long)]
+    threads: Option<usize>,
+    #[arg(long)]
+    hostname: Option<String>,
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long)]
+    username: Option<String>,
+    #[arg(long)]
+    password: Option<String>,
+
+    // Todo: Remove once experimental mode is primary
     #[arg(long, action = ArgAction::SetTrue)]
     sync: bool,
-    #[arg(long, default_value_t = 0)]
-    threads: usize,
-
     #[arg(long, action = ArgAction::SetTrue)]
     no_check: bool,
     #[arg(long, action = ArgAction::SetTrue)]
@@ -75,7 +91,9 @@ pub fn main() -> anyhow::Result<()> {
 
     // let cli = crate::setup().expect("Could not set up application");
     let cli = Cli::parse();
-    let _config = Config::new();
+    config::set_current_dir();
+
+    let config = Config::new().with_cli(&cli);
 
     let timer = TIMER.get_or_init(|| {
         let timer_format =
@@ -95,7 +113,7 @@ pub fn main() -> anyhow::Result<()> {
         .with_level(true)
         .with_writer(non_blocking_file)
         .with_ansi(false)
-        .with_filter(LevelFilter::from_level(cli.log));
+        .with_filter(LevelFilter::from_level(config.log_level));
     let logger = tracing_subscriber::registry();
     let logger = logger.with(file_log);
 
@@ -104,7 +122,7 @@ pub fn main() -> anyhow::Result<()> {
             fmt::layer()
                 .with_timer(TIMER.get().unwrap())
                 .with_ansi(false)
-                .with_filter(LevelFilter::from_level(cli.log)),
+                .with_filter(LevelFilter::from_level(config.log_level)),
         )
     } else {
         None
@@ -136,11 +154,7 @@ pub fn main() -> anyhow::Result<()> {
     }
 
     if cli.cli {
-        let runtime = Builder::new_multi_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .unwrap();
+        let runtime = get_tokio_runtime(Some(config));
         trace!("Running as cli: {runtime:#?}");
 
         runtime.spawn(async {
@@ -174,11 +188,7 @@ pub fn main() -> anyhow::Result<()> {
 }
 
 fn service_main(_arguments: Vec<OsString>) {
-    let runtime = Builder::new_multi_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .unwrap();
+    let runtime = get_tokio_runtime(None);
     trace!("Running as service");
 
     if let Err(e) = runtime.block_on(service::run_service()) {
@@ -186,12 +196,36 @@ fn service_main(_arguments: Vec<OsString>) {
     }
 }
 
+fn get_tokio_runtime(config: Option<Config>) -> Runtime {
+    let config = if let Some(config) = config {
+        config
+    } else {
+        let cli = Cli::parse();
+        Config::new().with_cli(&cli)
+    };
+
+    let mut runtime = Builder::new_multi_thread();
+    let runtime = if let Some(threads) = config.threads {
+        runtime.worker_threads(threads);
+        runtime
+    } else {
+        runtime
+    }
+    .enable_io()
+    .enable_time()
+    .build()
+    .unwrap();
+
+    runtime
+}
+
 pub async fn run<F>(callback: F, mut shutdown_channel: Option<Receiver<()>>) -> anyhow::Result<()>
 where
     F: AsyncFnOnce() -> (),
 {
     info!("Running main loop...");
-    let (config, cli) = (Config::new(), Cli::parse());
+    let cli = Cli::parse();
+    let config = Config::new().with_cli(&cli);
 
     if cli.experimental {
         let mut extractor = Extractor::new(Config::new());
@@ -254,7 +288,7 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
     let mut last_file = None;
 
     let mut files_found: Vec<ExtractFile> = Vec::new();
-    for sym in &config.syms {
+    for sym in &config.sym_names() {
         let dir = format!("/SYM/SYM{sym}/SQLEXTRACT");
         let mut sym_files = get_files(&session, &dir, |_| true).await?;
 
@@ -398,10 +432,8 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
 
     if let Some(last_file) = last_file {
         debug!("Last file found. Moving other files.");
-        if !std::fs::exists(&config.destination_path)
-            .context("Attempting to verify destination path")?
-        {
-            std::fs::create_dir(&config.destination_path).context("")?;
+        if !std::fs::exists(&config.destination).context("Attempting to verify destination path")? {
+            std::fs::create_dir(&config.destination).context("")?;
         }
         let mut moved = Vec::new();
         for file in files_found
@@ -411,7 +443,7 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
             if !moved.contains(&file.local_path) {
                 debug!("Moving {}", file.local_path);
                 moved.push(file.local_path.clone());
-                let mut file_destination = config.destination_path.clone();
+                let mut file_destination = config.destination.clone();
 
                 // These files hit length limits for converting to letter files
                 // so, we'll rename to the expected format here
@@ -436,7 +468,7 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
 
         debug!("Moving last file.");
         let last_file = files_found.get(last_file).unwrap();
-        let mut file_destination = config.destination_path.clone();
+        let mut file_destination = config.destination.clone();
         file_destination.push(&last_file.file_name);
         std::fs::rename(&last_file.local_path, file_destination)?;
 
@@ -444,7 +476,7 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
         for file in files_found {
             if Path::exists(&PathBuf::from(&file.local_path)) {
                 warn!("Leftover file found at {}", file.local_path);
-                if file.sym != *config.syms.last().unwrap() {
+                if file.sym != config.syms.last().unwrap().number {
                     let _ = std::fs::remove_file(file.local_path);
                 } else {
                     std::fs::rename(file.local_path, format!(".\\extracts\\{}", file.file_name))?
@@ -459,15 +491,19 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
 }
 
 async fn connect(config: &Config) -> anyhow::Result<SftpSession> {
-    debug!("Connecting to host '{}'", config.host);
+    debug!("Connecting to host '{}'", config.sftp.hostname);
     let russh_config = russh::client::Config::default();
 
     let sh = Client {};
-    let mut session =
-        russh::client::connect(Arc::new(russh_config), (&*config.host, config.port), sh).await?;
+    let mut session = russh::client::connect(
+        Arc::new(russh_config),
+        (&*config.sftp.hostname, config.sftp.port),
+        sh,
+    )
+    .await?;
 
     let mut interactive_response = session
-        .authenticate_keyboard_interactive_start(config.username.clone(), None)
+        .authenticate_keyboard_interactive_start(config.sftp.username.clone(), None)
         .await?;
 
     loop {
@@ -490,7 +526,7 @@ async fn connect(config: &Config) -> anyhow::Result<SftpSession> {
                 let resp = prompts
                     .iter()
                     .filter(|p| p.prompt.to_lowercase().contains("password"))
-                    .map(|_| config.password.clone())
+                    .map(|_| config.sftp.password.clone())
                     .collect::<Vec<String>>();
                 interactive_response = session
                     .authenticate_keyboard_interactive_respond(resp)
