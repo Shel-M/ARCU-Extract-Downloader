@@ -45,15 +45,19 @@ struct ConfigOptions {
 
     #[serde(deserialize_with = "deserialize_level")]
     log_level: Option<Level>,
+
+    // todo: remove
+    experimental: Option<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub destination: PathBuf,
     pub log_level: Level,
     pub download_queues: usize,
     pub threads: Option<usize>,
     pub debug: bool,
+    pub experimental: bool,
 
     pub sftp: Sftp,
     pub syms: Vec<Sym>,
@@ -101,6 +105,8 @@ impl Config {
             self.sftp.password = password.clone();
         }
 
+        self.experimental = self.experimental || cli.experimental;
+
         self
     }
 
@@ -124,6 +130,7 @@ impl From<ConfigOptions> for Config {
             destination: value.destination,
             threads: value.threads,
             debug: value.debug.unwrap_or(cfg!(debug_assertions)),
+            experimental: value.experimental.unwrap_or(false),
 
             sftp: value.sftp,
             syms: value.syms,
@@ -134,7 +141,7 @@ impl From<ConfigOptions> for Config {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Sftp {
     pub hostname: String,
     pub port: u16,
@@ -142,7 +149,7 @@ pub struct Sftp {
     pub password: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Sym {
     pub number: u16,
     #[allow(unused)] // Todo: remove allow

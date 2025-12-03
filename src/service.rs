@@ -70,7 +70,7 @@ pub async fn run_service() -> Result<()> {
                 error!("Service failed: {:?}", e);
             };
         },
-        Some(shutdown_rx),
+        shutdown_rx,
     ))
     .await?
 }
@@ -119,11 +119,10 @@ fn _uninstall(service: Service, manager: &ServiceManager) -> Result<()> {
     while start.elapsed() < timeout {
         if let Err(windows_service::Error::Winapi(e)) =
             manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+            && e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32)
         {
-            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) {
-                info!("{SERVICE_NAME} is deleted.");
-                return Ok(());
-            }
+            info!("{SERVICE_NAME} is deleted.");
+            return Ok(());
         }
         sleep(Duration::from_secs(1));
     }

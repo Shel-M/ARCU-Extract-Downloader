@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};

@@ -22,8 +22,13 @@ use clap::{ArgAction, Parser};
 use russh::client::KeyboardInteractiveAuthResponse;
 use russh_sftp::client::{SftpSession, fs::DirEntry};
 use time::{UtcOffset, format_description::BorrowedFormatItem, macros::format_description};
-use tokio::runtime::{Builder, Runtime};
-use tokio::sync::mpsc::Receiver;
+#[cfg(not(unix))]
+use tokio::signal;
+use tokio::sync::mpsc::{Receiver, channel};
+use tokio::{
+    runtime::{Builder, Runtime},
+    sync::mpsc::Sender,
+};
 use tracing::{Level, debug, error, trace, warn};
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::{
@@ -169,6 +174,10 @@ pub fn main() -> anyhow::Result<()> {
         let runtime = get_tokio_runtime(Some(config));
         trace!("Running as cli: {runtime:#?}");
 
+        let (shutdown_tx, shutdown_rx) = channel(8);
+
+        runtime.spawn(shutdown_signal(shutdown_tx));
+
         runtime.spawn(async {
             loop {
                 let runtime = tokio::runtime::Handle::current().metrics();
@@ -182,7 +191,7 @@ pub fn main() -> anyhow::Result<()> {
             }
         });
 
-        let ret = runtime.block_on(run(async || {}, None));
+        let ret = runtime.block_on(run(async || {}, shutdown_rx));
 
         let stop_time = Instant::now();
         trace!(
@@ -229,7 +238,24 @@ fn get_tokio_runtime(config: Option<Config>) -> Runtime {
     .unwrap()
 }
 
-pub async fn run<F>(callback: F, mut shutdown_channel: Option<Receiver<()>>) -> anyhow::Result<()>
+async fn shutdown_signal(shutdown_channel: Sender<()>) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(not(unix))]
+    let mut terminate =
+        signal::windows::ctrl_close().expect("failed to install Ctrl+Close handler");
+
+    tokio::select! {
+        _ = ctrl_c => { shutdown_channel.send(()).await.expect("Could not send shutdown message") },
+        _ = terminate.recv() => { shutdown_channel.send(()).await.expect("Could not send shutdown message") },
+    }
+}
+
+pub async fn run<F>(callback: F, mut shutdown_channel: Receiver<()>) -> anyhow::Result<()>
 where
     F: AsyncFnOnce() -> (),
 {
@@ -237,12 +263,33 @@ where
     let cli = Cli::parse();
     let config = Config::new().with_cli(&cli);
 
-    if cli.experimental {
-        let mut extractor = Extractor::new(Config::new());
-        extractor.syncronous(cli.sync);
-        extractor.queues(cli.threads);
-        extractor.watch().await.expect("Extractor failed"); //?;
-        extractor.close().await;
+    if config.experimental {
+        let mut extractor = Extractor::new(config.clone());
+        loop {
+            tokio::select! {
+                _ = shutdown_channel.recv() => {
+                    debug!("Received shutdown signal.");
+                    break;
+                }
+                extractor_result = extractor.watch() => {
+                    match extractor_result {
+                        Ok(()) => info!("Extractor succeeded"),
+                        Err(e) => {
+                            error!("Extractor failed: {e}"); //?;
+                            _ = std::fs::remove_dir_all(r#".\extracts\"#);
+                            continue;
+                        }
+                    }
+                }
+            }
+            extractor.close().await;
+            if config.debug {
+                debug!(
+                    "Exiting due to running in debug. If this is not intended, compile with 'cargo build --release'"
+                );
+                break;
+            }
+        }
     } else {
         loop {
             let mut done = false;
@@ -266,17 +313,13 @@ where
                 sleep_time = Duration::from_secs(HOUR + (HOUR / 2));
             }
 
-            if let Some(ref mut rx) = shutdown_channel {
-                tokio::select! {
-                    _ = rx.recv() => {
-                        debug!("Received shutdown signal.");
-                        break;
-                    }
-                    _ = tokio::time::sleep(sleep_time) => ()
-
+            tokio::select! {
+                _ = shutdown_channel.recv() => {
+                    debug!("Received shutdown signal.");
+                    break;
                 }
-            } else {
-                tokio::time::sleep(sleep_time).await;
+                _ = tokio::time::sleep(sleep_time) => ()
+
             }
         }
 

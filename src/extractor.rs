@@ -1,5 +1,5 @@
 // #![allow(unused)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -20,11 +20,8 @@ pub struct Extractor {
 
     config: Config,
 
-    sync: bool,
     queue_count: usize,
 }
-
-// Note: Check running jobs on Symitar with "/SYM/MACROS/QUEUECONTROL -BATCH"
 
 impl Extractor {
     pub fn new(config: Config) -> Self {
@@ -35,20 +32,6 @@ impl Extractor {
 
             sftp_session: None,
             ssh_session: None,
-            sync: false, // todo: Change default to async when ready
-        }
-    }
-
-    pub fn syncronous(&mut self, sync: bool) {
-        self.sync = sync
-    }
-
-    pub fn queues(&mut self, queue_count: Option<usize>) {
-        let Some(queue_count) = queue_count else {
-            return;
-        };
-        if queue_count > 0 {
-            self.queue_count = queue_count;
         }
     }
 
@@ -71,6 +54,8 @@ impl Extractor {
 
     pub async fn process(&mut self) -> anyhow::Result<()> {
         info!("Processing...");
+        self.connect_ssh().await?;
+        self.connect_sftp().await?;
 
         // Check and wait for completion of running ARCU extracts.
         trace!("Checking for ARCU Extracts to be finished.");
@@ -107,8 +92,8 @@ impl Extractor {
                     .await?,
             );
         }
-        files.sort_by(|a, b| (a.len as i128 - b.len as i128).cmp(&((a.len) as i128)));
-        // files.reverse();
+
+        files.sort_by_key(|k| k.len);
         trace!("{files:#?}");
 
         let sftp = self.get_sftp();
@@ -121,8 +106,6 @@ impl Extractor {
                     break 'retry;
                 }
             }
-
-            let queue_count = if self.sync { 1 } else { self.queue_count };
 
             // Non-feature parity todo: Make queues a distinct struct, with message passing for monitoring and logging
             // of all queues at once.
@@ -139,7 +122,7 @@ impl Extractor {
                 }
 
                 // Don't do the next calculation if unnecessary
-                if queue_count == 1 {
+                if self.queue_count == 1 {
                     queues[0].push(file);
                     continue;
                 }
@@ -176,7 +159,8 @@ impl Extractor {
         {
             return Err(anyhow::anyhow!("No Lastfile in file listing?"));
         }
-        // Todo: Move files
+
+        self.move_files(files)?;
 
         Ok(())
     }
@@ -230,52 +214,117 @@ impl Extractor {
         }
 
         let ssh = self.get_ssh();
-        if self.sync {
-            for file in files.iter_mut() {
-                file.checksum = Self::get_checksum(ssh.clone(), &file.remote_path).await?;
+        'retry: for retry in 0..10 {
+            let queue_count = if retry > 0 {
+                warn!("Retrying failed files. Retry number {retry}");
+                if files.iter().filter(|f| f.error).count() == 0 {
+                    debug!("No files to checksum on run {retry}.");
+                    break 'retry;
+                }
+
+                1
+            } else {
+                3
+            };
+
+            let mut queues: Vec<Vec<ExtractFile>> = Vec::new();
+            for _ in 0..queue_count {
+                queues.push(Vec::with_capacity(files.len() / queue_count + 1));
             }
-        } else {
-            'retry: for retry in 0..10 {
-                if retry > 0 {
-                    warn!("Retrying failed files. Retry number {retry}");
-                    if files.iter().filter(|f| f.error).count() == 0 {
-                        debug!("No files to checksum on run {retry}.");
-                        break 'retry;
-                    }
+
+            let mut i = 0;
+            let mut completed = Vec::new();
+            while let Some(file) = files.pop() {
+                if !file.error && file.complete {
+                    completed.push(file);
+                    continue;
                 }
 
-                let queue_count = if self.sync || retry > 0 { 1 } else { 3 };
+                queues[i % queue_count].push(file);
+                i += 1;
+            }
 
-                let mut queues: Vec<Vec<ExtractFile>> = Vec::new();
-                for _ in 0..queue_count {
-                    queues.push(Vec::with_capacity(files.len() / queue_count + 1));
-                }
+            let mut task_set = tokio::task::JoinSet::new();
+            for (q, queue) in queues.into_iter().enumerate() {
+                task_set.spawn(Self::get_checksums(ssh.clone(), queue, q));
+            }
+            let queues = task_set.join_all().await;
 
-                let mut i = 0;
-                let mut completed = Vec::new();
-                while let Some(file) = files.pop() {
-                    if !file.error && file.complete {
-                        completed.push(file);
-                        continue;
-                    }
-
-                    queues[i % queue_count].push(file);
-                    i += 1;
-                }
-
-                let mut task_set = tokio::task::JoinSet::new();
-                for (q, queue) in queues.into_iter().enumerate() {
-                    task_set.spawn(Self::get_checksums(ssh.clone(), queue, q));
-                }
-                let queues = task_set.join_all().await;
-
-                for mut queue in queues {
-                    files.append(&mut queue);
-                }
+            for mut queue in queues {
+                files.append(&mut queue);
             }
         }
 
         Ok(files)
+    }
+
+    fn move_files(&self, files: Vec<ExtractFile>) -> anyhow::Result<()> {
+        if !std::fs::exists(&self.config.destination)
+            .context("Attempting to verify destination path")?
+        {
+            std::fs::create_dir(&self.config.destination).context("")?;
+        }
+        let mut moved = Vec::new();
+        for file in files
+            .iter()
+            .filter(|f| f.file_name != "EXTRACT_LASTFILE.txt")
+        {
+            if !moved.contains(&file.local_path) {
+                debug!("Moving {}", file.local_path);
+                moved.push(file.local_path.clone());
+                let mut file_destination = self.config.destination.clone();
+
+                // These files hit length limits for converting to letter files
+                // so, we'll rename to the expected format here
+                if file.file_name == *"Episys_Database__Extract_Stats" {
+                    file_destination.push("Episys_Database__Extract_Statistics.txt");
+                } else if file.file_name.starts_with("CD_Trial_Bal_for_") {
+                    // IE CD_Trial_Bal_for_01_03_24
+                    let date = &file.file_name.trim_start_matches("CD_Trial_Bal_for_");
+                    file_destination
+                        .push("Close_Day_Trial_Balance_for_".to_owned() + date + ".txt");
+                } else {
+                    file_destination.push(&file.file_name);
+                }
+
+                std::fs::rename(&file.local_path, &file_destination).context(format!(
+                    "Failed to move file '{}' to '{}'",
+                    file.local_path,
+                    &file_destination.display()
+                ))?
+            }
+        }
+
+        debug!("Moving last file.");
+
+        let mut last_file = None;
+        for (i, file) in files.iter().enumerate() {
+            if let "EXTRACT_LASTFILE.txt" = &*file.file_name {
+                last_file = Some(i)
+            };
+        }
+        let Some(last_file) = last_file else {
+            return Err(anyhow!("No Last File found?"));
+        };
+
+        let last_file = files.get(last_file).unwrap();
+        let mut file_destination = self.config.destination.clone();
+        file_destination.push(&last_file.file_name);
+        std::fs::rename(&last_file.local_path, file_destination)?;
+
+        debug!("Checking for leftover files");
+        for file in files {
+            if Path::exists(&PathBuf::from(&file.local_path)) {
+                warn!("Leftover file found at {}", file.local_path);
+                if file.sym != self.config.syms.last().unwrap().number {
+                    let _ = std::fs::remove_file(file.local_path);
+                } else {
+                    std::fs::rename(file.local_path, format!(".\\extracts\\{}", file.file_name))?
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn get_checksum(ssh: Arc<RwLock<SshClient>>, path: &str) -> anyhow::Result<String> {
@@ -378,7 +427,10 @@ impl Extractor {
         q_number: usize,
     ) -> anyhow::Result<Vec<ExtractFile>> {
         for file in queue.iter_mut() {
-            debug!("Downloading '{}' in queue {q_number}", file.file_name);
+            debug!(
+                "Downloading '{}' in queue {q_number} (len: {})",
+                file.file_name, file.len
+            );
             Self::download(sftp.clone(), file).await?;
         }
         Ok(queue)
