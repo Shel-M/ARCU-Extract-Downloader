@@ -1,12 +1,14 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};
-use russh::{keys::PublicKey, ChannelId};
-use russh::{ChannelMsg, Disconnect};
-use russh_sftp::client::fs::ReadDir;
+use russh::{ChannelId, keys::PublicKey};
+use russh::{ChannelMsg, Disconnect, Preferred};
 use russh_sftp::client::SftpSession;
+use russh_sftp::client::fs::ReadDir;
 use tracing::{debug, error, trace};
 
 use crate::config::Config;
@@ -19,9 +21,22 @@ pub struct SftpClient {
 impl SftpClient {
     pub async fn connect(config: &Config) -> anyhow::Result<Self> {
         debug!("Connecting to host '{}'", config.sftp.hostname);
-        let russh_config = russh::client::Config {
+        // let russh_config = russh::client::Config {
+        //     channel_buffer_size: 400,
+        //     ..Default::default()
+        // };
+        let russh_config = client::Config {
             channel_buffer_size: 400,
-            ..Default::default()
+            // inactivity_timeout: Some(Duration::from_secs(5)),
+            preferred: Preferred {
+                kex: Cow::Owned(vec![
+                    russh::kex::CURVE25519,
+                    russh::kex::CURVE25519_PRE_RFC_8731,
+                    russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
+                ]),
+                ..Default::default()
+            },
+            ..<_>::default()
         };
 
         let sh = Client {};
@@ -68,6 +83,7 @@ impl SftpClient {
         let channel = session.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
 
+        trace!("Connected SFTP session");
         Ok(Self {
             session: SftpSession::new(channel.into_stream()).await?,
             closed: false,
@@ -103,7 +119,19 @@ pub struct SshClient {
 impl SshClient {
     pub async fn connect(config: &Config) -> anyhow::Result<Self> {
         println!("Connecting to host '{}'", config.sftp.hostname);
-        let russh_config = russh::client::Config::default();
+        // let russh_config = russh::client::Config::default();
+        let russh_config = client::Config {
+            // inactivity_timeout: Some(Duration::from_secs(5)),
+            preferred: Preferred {
+                kex: Cow::Owned(vec![
+                    russh::kex::CURVE25519,
+                    russh::kex::CURVE25519_PRE_RFC_8731,
+                    russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
+                ]),
+                ..Default::default()
+            },
+            ..<_>::default()
+        };
 
         let sh = Client {};
         let mut session = russh::client::connect(
@@ -146,6 +174,7 @@ impl SshClient {
             }
         }
 
+        trace!("Connected SSH session");
         Ok(Self { session })
     }
 
@@ -182,7 +211,10 @@ impl SshClient {
 
         let mut command_out = Vec::new();
         for line in command_stdout {
-            command_out.push(String::from_utf8(line)?);
+            let utf8_line = String::from_utf8(line)?;
+            trace!("received line from command: '{utf8_line}'");
+            let mut utf8_lines = utf8_line.lines().map(String::from).collect();
+            command_out.append(&mut utf8_lines);
         }
 
         Ok((command_out, code.expect("program did not exit cleanly")))
@@ -205,7 +237,7 @@ impl client::Handler for Client {
         &mut self,
         _server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        //info!("check_server_key: {:?}", server_public_key);
+        trace!("check_server_key: {:?}", _server_public_key);
         Ok(true)
     }
 
