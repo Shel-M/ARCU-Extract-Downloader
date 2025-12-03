@@ -1,4 +1,4 @@
-use serde::{de, Deserialize};
+use serde::{Deserialize, de};
 use std::{
     env,
     fs::{self, read_to_string},
@@ -37,6 +37,7 @@ struct ConfigOptions {
     destination: PathBuf,
     download_queues: Option<usize>,
     threads: Option<usize>,
+    debug: Option<bool>,
 
     sftp: Sftp,
     #[serde(rename = "sym")]
@@ -52,6 +53,7 @@ pub struct Config {
     pub log_level: Level,
     pub download_queues: usize,
     pub threads: Option<usize>,
+    pub debug: bool,
 
     pub sftp: Sftp,
     pub syms: Vec<Sym>,
@@ -85,7 +87,7 @@ impl Config {
         if let Some(threads) = cli.threads {
             self.threads = Some(threads)
         }
-
+        self.debug = self.debug || cli.debug;
         if let Some(ref hostname) = cli.hostname {
             self.sftp.hostname = hostname.clone();
         }
@@ -105,6 +107,9 @@ impl Config {
     pub fn sym_names(&self) -> Vec<u16> {
         self.syms.iter().map(|s| s.number).collect()
     }
+    pub fn sym_jobs(&self) -> Vec<&String> {
+        self.syms.iter().map(|s| &s.extract_job).collect()
+    }
 }
 
 impl From<ConfigOptions> for Config {
@@ -118,6 +123,7 @@ impl From<ConfigOptions> for Config {
         Self {
             destination: value.destination,
             threads: value.threads,
+            debug: value.debug.unwrap_or(cfg!(debug_assertions)),
 
             sftp: value.sftp,
             syms: value.syms,

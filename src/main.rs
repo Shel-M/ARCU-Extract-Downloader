@@ -20,17 +20,17 @@ use crate::extractor::Extractor;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
 use russh::client::KeyboardInteractiveAuthResponse;
-use russh_sftp::client::{fs::DirEntry, SftpSession};
-use time::{format_description::BorrowedFormatItem, macros::format_description, UtcOffset};
+use russh_sftp::client::{SftpSession, fs::DirEntry};
+use time::{UtcOffset, format_description::BorrowedFormatItem, macros::format_description};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::Receiver;
-use tracing::{debug, error, trace, warn, Level};
+use tracing::{Level, debug, error, trace, warn};
 use tracing::{info, level_filters::LevelFilter};
-use tracing_subscriber::{fmt::time::OffsetTime, layer::SubscriberExt};
 use tracing_subscriber::{
-    fmt::{self},
     Layer,
+    fmt::{self},
 };
+use tracing_subscriber::{fmt::time::OffsetTime, layer::SubscriberExt};
 use windows_service::{define_windows_service, service_dispatcher};
 
 #[derive(Parser, Debug)]
@@ -49,6 +49,10 @@ pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     reinstall: bool,
 
+    // Only turn on for russh debug. It produces a *lot* of log messages.
+    #[arg(long, action = ArgAction::SetTrue)]
+    debug_russh: bool,
+
     // Config overlay arguments
     #[arg(long)]
     destination: Option<PathBuf>,
@@ -60,6 +64,8 @@ pub struct Cli {
     queue_count: Option<usize>,
     #[arg(long)]
     threads: Option<usize>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    debug: bool,
     #[arg(long)]
     hostname: Option<String>,
     #[arg(long)]
@@ -103,6 +109,12 @@ pub fn main() -> anyhow::Result<()> {
             timer_format,
         )
     });
+
+    // Only turn on for russh debug. It produces a *lot* of log messages.
+    if cli.debug_russh {
+        use tracing_log::LogTracer;
+        LogTracer::init()?;
+    }
 
     let appender =
         tracing_appender::rolling::daily(r#"C:\dev\extract-downloader\logs"#, "log_test.log");
@@ -161,7 +173,7 @@ pub fn main() -> anyhow::Result<()> {
             loop {
                 let runtime = tokio::runtime::Handle::current().metrics();
                 trace!(
-                    "{} : {}",
+                    "runtime watch: tasks alive: {} queue_depth: {}",
                     runtime.num_alive_tasks(),
                     runtime.global_queue_depth()
                 );
@@ -205,7 +217,7 @@ fn get_tokio_runtime(config: Option<Config>) -> Runtime {
     };
 
     let mut runtime = Builder::new_multi_thread();
-    let runtime = if let Some(threads) = config.threads {
+    if let Some(threads) = config.threads {
         runtime.worker_threads(threads);
         runtime
     } else {
@@ -214,9 +226,7 @@ fn get_tokio_runtime(config: Option<Config>) -> Runtime {
     .enable_io()
     .enable_time()
     .build()
-    .unwrap();
-
-    runtime
+    .unwrap()
 }
 
 pub async fn run<F>(callback: F, mut shutdown_channel: Option<Receiver<()>>) -> anyhow::Result<()>
@@ -231,7 +241,8 @@ where
         let mut extractor = Extractor::new(Config::new());
         extractor.syncronous(cli.sync);
         extractor.queues(cli.threads);
-        extractor.process().await.expect("Extractor failed"); //?;
+        extractor.watch().await.expect("Extractor failed"); //?;
+        extractor.close().await;
     } else {
         loop {
             let mut done = false;
@@ -242,15 +253,16 @@ where
 
             let mut sleep_time = Duration::from_secs(60);
 
-            if cfg!(debug_assertions) {
-                debug!("Exiting due to running in debug. If this is not intended, compile with 'cargo build --release'");
+            if config.debug {
+                debug!(
+                    "Exiting due to running in debug. If this is not intended, compile with 'cargo build --release'"
+                );
                 break;
             }
             if done {
                 debug!(
-                "Full completion of processing detected. Waiting 90 minutes before checking for new files."
-
-            );
+                    "Full completion of processing detected. Waiting 90 minutes before checking for new files."
+                );
                 sleep_time = Duration::from_secs(HOUR + (HOUR / 2));
             }
 
@@ -324,7 +336,7 @@ async fn process(config: &Config, cli: &Cli) -> anyhow::Result<bool> {
     }
 
     // Todo: implement a better way to wait for job completion
-    if !files_found.is_empty() && !cfg!(debug_assertions) {
+    if !files_found.is_empty() && !config.debug {
         debug!("Waiting 1 hour for batch job to complete.");
         tokio::time::sleep(Duration::from_secs(HOUR)).await; //
     }

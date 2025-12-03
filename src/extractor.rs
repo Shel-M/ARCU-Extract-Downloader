@@ -1,9 +1,10 @@
-#![allow(unused)]
+// #![allow(unused)]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use anyhow::anyhow;
 use russh_sftp::client::fs::DirEntry;
 use tokio::fs;
 use tokio::sync::RwLock;
@@ -20,7 +21,6 @@ pub struct Extractor {
     config: Config,
 
     sync: bool,
-    checksum: bool,
     queue_count: usize,
 }
 
@@ -28,25 +28,19 @@ pub struct Extractor {
 
 impl Extractor {
     pub fn new(config: Config) -> Self {
-        let handle = tokio::runtime::Handle::current();
+        let queue_count = config.download_queues;
         Self {
             config,
+            queue_count,
 
             sftp_session: None,
             ssh_session: None,
             sync: false, // todo: Change default to async when ready
-            checksum: true,
-            // 3 download queues is the sweet spot it seems
-            queue_count: 3, //tokio::runtime::RuntimeMetrics::num_workers(&handle.metrics()),
         }
     }
 
     pub fn syncronous(&mut self, sync: bool) {
         self.sync = sync
-    }
-
-    pub fn checksum(&mut self, checksum: bool) {
-        self.checksum = checksum
     }
 
     pub fn queues(&mut self, queue_count: Option<usize>) {
@@ -59,17 +53,31 @@ impl Extractor {
     }
 
     pub async fn close(&mut self) {
-        self.get_sftp().write().await.close();
-        self.get_ssh().write().await.close();
+        let _ = self.get_sftp().write().await.close().await;
+        let _ = self.get_ssh().write().await.close().await;
+    }
+
+    pub async fn watch(&mut self) -> anyhow::Result<()> {
+        self.connect_ssh().await?;
+        self.connect_sftp().await?;
+
+        while !self.extracts_running().await? && !self.config.debug {
+            debug!("Waiting 15 minutes for ARCU Extracts to be running...");
+            tokio::time::sleep(Duration::from_secs(300 * 3)).await
+        }
+
+        self.process().await
     }
 
     pub async fn process(&mut self) -> anyhow::Result<()> {
         info!("Processing...");
 
-        self.connect_sftp().await?;
-        self.connect_ssh().await?;
-
-        // Todo: Check and wait for completion of running ARCU extracts.
+        // Check and wait for completion of running ARCU extracts.
+        trace!("Checking for ARCU Extracts to be finished.");
+        while self.extracts_running().await? {
+            debug!("Waiting 5 minutes for ARCU Extracts to be finished...");
+            tokio::time::sleep(Duration::from_secs(300)).await
+        }
 
         let mut files = Vec::new();
         for sym in &self.config.syms {
@@ -99,9 +107,9 @@ impl Extractor {
                     .await?,
             );
         }
-        trace!("{files:#?}");
         files.sort_by(|a, b| (a.len as i128 - b.len as i128).cmp(&((a.len) as i128)));
-        files.reverse();
+        // files.reverse();
+        trace!("{files:#?}");
 
         let sftp = self.get_sftp();
 
@@ -116,7 +124,7 @@ impl Extractor {
 
             let queue_count = if self.sync { 1 } else { self.queue_count };
 
-            // Todo: Make queues a distinct struct, with message passing for monitoring and logging
+            // Non-feature parity todo: Make queues a distinct struct, with message passing for monitoring and logging
             // of all queues at once.
             let mut queues: Vec<Vec<ExtractFile>> = Vec::with_capacity(self.queue_count);
             for _ in 0..self.queue_count {
@@ -149,11 +157,12 @@ impl Extractor {
 
             let mut task_set = tokio::task::JoinSet::new();
             for (q, queue) in queues.into_iter().enumerate() {
-                task_set.spawn(Self::queue_download(sftp.clone(), queue, q));
+                task_set.spawn(Self::queue_downloads(sftp.clone(), queue, q));
             }
             let queues = task_set.join_all().await;
 
-            for mut queue in queues {
+            for queue in queues {
+                let mut queue = queue?;
                 files.append(&mut queue);
             }
         }
@@ -188,16 +197,14 @@ impl Extractor {
 
         // If running debug, we can
         // grab the last day of files. If not, just the last hour should do it.
-        let file_age = if cfg!(debug_assertions) {
+        let file_age = if self.config.debug {
             DAY
         } else {
             HOUR + HALF_HOUR
         };
-        let file_age = DAY;
 
         let client = self.get_sftp();
         let client = client.read().await;
-        let shell = self.get_ssh();
 
         for entry in client.read_dir(&dir).await?.filter(filter).filter(|f| {
             f.metadata().modified().unwrap()
@@ -258,7 +265,7 @@ impl Extractor {
 
                 let mut task_set = tokio::task::JoinSet::new();
                 for (q, queue) in queues.into_iter().enumerate() {
-                    task_set.spawn(Self::queue_checksum(ssh.clone(), queue, q));
+                    task_set.spawn(Self::get_checksums(ssh.clone(), queue, q));
                 }
                 let queues = task_set.join_all().await;
 
@@ -293,7 +300,19 @@ impl Extractor {
         Ok(checksum)
     }
 
-    async fn queue_checksum(
+    async fn extracts_running(&self) -> anyhow::Result<bool> {
+        let running_jobs = BatchJobs::try_new(self.get_ssh()).await?;
+        trace!("running_jobs: {running_jobs:#?}");
+
+        let arcu_running = running_jobs
+            .iter()
+            .any(|b| self.config.sym_jobs().contains(&&b.job_name));
+        debug!("ARCU Extracts running? {arcu_running}");
+
+        Ok(arcu_running)
+    }
+
+    async fn get_checksums(
         ssh: Arc<RwLock<SshClient>>,
         mut queue: Vec<ExtractFile>,
         q_number: usize,
@@ -317,21 +336,6 @@ impl Extractor {
         queue
     }
 
-    async fn file_checksum(ssh: Arc<RwLock<SshClient>>, mut file: ExtractFile) -> ExtractFile {
-        debug!("Checksumming '{}'", file.file_name);
-        match Self::get_checksum(ssh.clone(), &file.remote_path).await {
-            Ok(s) => {
-                file.checksum = s;
-                file.error = false;
-            }
-            Err(e) => {
-                error!("Error retrieving checksum: {e}");
-                file.error = true;
-            }
-        }
-        file
-    }
-
     async fn download(sftp: Arc<RwLock<SftpClient>>, file: &mut ExtractFile) -> anyhow::Result<()> {
         let local_file = format!("{}\\{}", file.local_path, file.file_name);
 
@@ -344,7 +348,7 @@ impl Extractor {
 
         let sftp_file = sftp.read(&file.remote_path).await?;
 
-        let mut md5 = md5::compute(&sftp_file);
+        let md5 = md5::compute(&sftp_file);
         let md5_result = format!("{md5:x}");
 
         debug!("file '{}'", file.file_name);
@@ -368,22 +372,16 @@ impl Extractor {
         Ok(())
     }
 
-    async fn queue_download(
+    async fn queue_downloads(
         sftp: Arc<RwLock<SftpClient>>,
         mut queue: Vec<ExtractFile>,
         q_number: usize,
-    ) -> Vec<ExtractFile> {
+    ) -> anyhow::Result<Vec<ExtractFile>> {
         for file in queue.iter_mut() {
             debug!("Downloading '{}' in queue {q_number}", file.file_name);
-            Self::download(sftp.clone(), file).await;
+            Self::download(sftp.clone(), file).await?;
         }
-        queue
-    }
-
-    async fn file_download(sftp: Arc<RwLock<SftpClient>>, mut file: ExtractFile) -> ExtractFile {
-        debug!("Downloading '{}'", file.file_name);
-        Self::download(sftp.clone(), &mut file).await;
-        file
+        Ok(queue)
     }
 
     pub async fn connect_sftp(&mut self) -> anyhow::Result<()> {
@@ -426,7 +424,7 @@ impl Extractor {
             self.ssh_session = Some(Arc::new(RwLock::new(
                 SshClient::connect(&self.config)
                     .await
-                    .context("Could not connect via SFTP")?,
+                    .context("Could not connect via SSH")?,
             )));
         }
         Ok(())
@@ -439,6 +437,7 @@ impl Extractor {
     }
 }
 
+#[allow(unused)]
 #[derive(Debug, Default)]
 struct ExtractFile {
     file_name: String,
@@ -464,9 +463,156 @@ impl ExtractFile {
             ..Default::default()
         }
     }
+}
 
-    async fn download(&mut self, destination_path: String) -> anyhow::Result<()> {
-        todo!();
-        Ok(())
+#[allow(unused)]
+#[derive(Debug)]
+struct BatchJobs {
+    queue: i64,
+    status: BatchQueueStatus,
+    job_name: String,
+}
+
+impl BatchJobs {
+    async fn try_new(ssh: Arc<RwLock<SshClient>>) -> anyhow::Result<Vec<Self>> {
+        let queues = BatchQueues::try_new(ssh).await?;
+
+        Ok(queues
+            .into_iter()
+            .filter(|q| match &q.status {
+                BatchQueueStatus::Ready => false,
+                BatchQueueStatus::Running => true,
+                BatchQueueStatus::Queued => true,
+                BatchQueueStatus::Unknown(s) => {
+                    error!("Unknown batch queue status? {s}");
+                    false
+                }
+            })
+            .map(|q| Self {
+                queue: q.queue,
+                status: q.status,
+                job_name: q.job_name,
+            })
+            .collect())
+    }
+}
+
+#[allow(unused)]
+#[derive(Debug)]
+struct BatchQueues {
+    queue: i64,
+    status: BatchQueueStatus,
+    device: String,
+    job_seq: Option<u64>,
+    job_name: String,
+    user: String,
+}
+
+impl BatchQueues {
+    async fn try_new(ssh: Arc<RwLock<SshClient>>) -> anyhow::Result<Vec<Self>> {
+        let command_response = Self::get_batch_running(ssh).await?;
+
+        Self::try_from_command(command_response)
+    }
+
+    async fn get_batch_running(ssh: Arc<RwLock<SshClient>>) -> anyhow::Result<Vec<String>> {
+        let ssh = ssh.read().await;
+        let queues = ssh.call("/SYM/MACROS/QUEUECONTROL -BATCH").await;
+        let queues = if let Err(e) = queues {
+            error!("{e:#?}");
+            return Err(e).context("Could not retrieve batch queues");
+        } else {
+            queues?
+        };
+        trace!("Queuecontrol command returned '{queues:#?}'");
+
+        let queues = queues.0.iter().map(String::from).collect::<Vec<String>>();
+
+        Ok(queues)
+    }
+
+    fn try_from_command(value: Vec<String>) -> anyhow::Result<Vec<Self>> {
+        let mut value_iter = value.iter();
+        let _header = value_iter.next();
+
+        let Some(dash_line) = value_iter.next() else {
+            return Err(anyhow!("No dashed line found in values"));
+        };
+        let lengths = dash_line.split_whitespace();
+        if lengths.clone().count() != 6 {
+            return Err(anyhow!("Not enough dashed lines for line lengths?"));
+        }
+        let mut tot_length = 0;
+        let lengths = lengths
+            .map(|s| {
+                let len = s.len() + 1;
+                tot_length += len;
+                tot_length
+            })
+            .collect::<Vec<usize>>();
+        trace!("Command position/length indexes {lengths:?}");
+
+        let mut res = Vec::new();
+        let mut queue = -1;
+        for batch_line in value_iter {
+            let q_line = batch_line[..lengths[0]]
+                .trim()
+                .chars()
+                .filter(|c| c.is_numeric())
+                .collect::<String>();
+            if !q_line.is_empty() {
+                queue = q_line.parse()?;
+            }
+
+            let (job_seq, job_name, user) = if batch_line.len() > lengths[4] {
+                (
+                    Some(
+                        batch_line[lengths[2]..lengths[3]]
+                            .trim()
+                            .to_string()
+                            .parse::<u64>()?,
+                    ),
+                    batch_line[lengths[3]..lengths[4]].trim().to_string(),
+                    batch_line[lengths[4]..].trim().to_string(),
+                )
+            } else {
+                (None, String::new(), String::new())
+            };
+
+            res.push(BatchQueues {
+                queue,
+
+                device: batch_line[lengths[0]..lengths[1]].trim().into(),
+                status: batch_line[lengths[1]..lengths[2].min(batch_line.len())]
+                    .trim()
+                    .into(),
+                job_seq,
+                job_name,
+                user,
+            });
+        }
+
+        trace!("BatchQueues: {res:#?}");
+
+        Ok(res)
+    }
+}
+
+#[derive(Debug)]
+enum BatchQueueStatus {
+    Ready,
+    Running,
+    Queued,
+    Unknown(String),
+}
+
+impl From<&str> for BatchQueueStatus {
+    fn from(value: &str) -> Self {
+        match value.to_lowercase().trim() {
+            "ready" => Self::Ready,
+            "running" => Self::Running,
+            "queued" => Self::Queued,
+            _ => Self::Unknown(value.to_string()),
+        }
     }
 }
