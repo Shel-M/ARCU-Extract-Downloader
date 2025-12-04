@@ -18,7 +18,7 @@ use crate::extract_file::ExtractFile;
 use crate::extractor::Extractor;
 
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, crate_version};
 use russh::client::KeyboardInteractiveAuthResponse;
 use russh_sftp::client::{SftpSession, fs::DirEntry};
 use time::{UtcOffset, format_description::BorrowedFormatItem, macros::format_description};
@@ -145,12 +145,12 @@ pub fn main() -> anyhow::Result<()> {
 
     let logging = logger.with(console_log);
     tracing::subscriber::set_global_default(logging).expect("Unable to set up logging");
+
+    trace!("Running extract downloader v{}", crate_version!());
     trace!(
-        "Startup complete in {}",
+        "Startup complete. Running in {}",
         env::current_dir().unwrap_or(PathBuf::from("\\?")).display()
     );
-
-    trace!("Running as main (2)");
 
     #[cfg(debug_assertions)]
     {
