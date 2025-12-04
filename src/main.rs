@@ -41,49 +41,64 @@ use windows_service::{define_windows_service, service_dispatcher};
 #[derive(Parser, Debug)]
 #[command(next_line_help = true)]
 pub struct Cli {
+    /// Run in CLI mode
     #[arg(long, action = ArgAction::SetTrue)]
     cli: bool,
 
+    /// Install as Windows service
     #[arg(long, action = ArgAction::SetTrue)]
     install: bool,
+    /// Uninstall Windows service
     #[arg(long, action = ArgAction::SetTrue)]
     uninstall: bool,
+    /// Reinstall Windows service
     #[arg(long, action = ArgAction::SetTrue)]
     reinstall: bool,
 
-    // Only turn on for russh debug. It produces a *lot* of log messages.
+    /// Only turn on for russh debug. It produces a *lot* of log messages.
     #[arg(long, action = ArgAction::SetTrue)]
     debug_russh: bool,
 
     // Config overlay arguments
+    /// Destination for downloaded files. eg F:/arcuftp/epiodbc
     #[arg(long)]
     destination: Option<PathBuf>,
     /// Logging level - see "https://docs.rs/tracing-core/latest/src/tracing_core/metadata.rs.html#553" for how this is parsed.  Default: warn
     #[arg(short, long)]
     log_level: Option<Level>,
-    /// Number of download queues
+    /// Number of download queues.
     #[arg(long, short)]
     queue_count: Option<usize>,
+    /// Number of concurrent threads. You probably want --queue_count.
     #[arg(long)]
     threads: Option<usize>,
+    /// Run in debug mode. Does not wait for remote ARCU Extract jobs and only runs through once.
     #[arg(long, action = ArgAction::SetTrue)]
     debug: bool,
+    /// Run and download, but don't move to `destination` directory. Useful for troubleshooting.
     #[arg(long, action = ArgAction::SetTrue)]
     dry: bool,
+    /// Override source ssh/sftp host
     #[arg(long)]
     hostname: Option<String>,
+    /// Override source ssh/sftp port. Default: 22
     #[arg(long)]
     port: Option<u16>,
+    /// Override source ssh/sftp authentication username
     #[arg(long)]
     username: Option<String>,
+    /// Override source ssh/sftp authentication password
     #[arg(long)]
     password: Option<String>,
 
     // Todo: Remove once experimental mode is primary
+    /// Legacy only: Run in single-threaded mode
     #[arg(long, action = ArgAction::SetTrue)]
     sync: bool,
+    /// Legacy only: Skip checksum validation
     #[arg(long, action = ArgAction::SetTrue)]
     no_check: bool,
+    /// Run in experimental mode.
     #[arg(long, action = ArgAction::SetTrue)]
     experimental: bool,
 }
