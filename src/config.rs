@@ -38,6 +38,7 @@ struct ConfigOptions {
     download_queues: Option<usize>,
     threads: Option<usize>,
     debug: Option<bool>,
+    dry: Option<bool>,
 
     sftp: Sftp,
     #[serde(rename = "sym")]
@@ -57,6 +58,7 @@ pub struct Config {
     pub download_queues: usize,
     pub threads: Option<usize>,
     pub debug: bool,
+    pub dry: bool,
     pub experimental: bool,
 
     pub sftp: Sftp,
@@ -92,6 +94,7 @@ impl Config {
             self.threads = Some(threads)
         }
         self.debug = self.debug || cli.debug;
+        self.dry = self.dry || cli.dry;
         if let Some(ref hostname) = cli.hostname {
             self.sftp.hostname = hostname.clone();
         }
@@ -130,6 +133,7 @@ impl From<ConfigOptions> for Config {
             destination: value.destination,
             threads: value.threads,
             debug: value.debug.unwrap_or(cfg!(debug_assertions)),
+            dry: value.dry.unwrap_or(false),
             experimental: value.experimental.unwrap_or(false),
 
             sftp: value.sftp,
@@ -152,8 +156,16 @@ pub struct Sftp {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Sym {
     pub number: u16,
-    #[allow(unused)] // Todo: remove allow
     pub extract_job: String,
+    pub extract_part: SymExtractPart,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, PartialOrd, Default)]
+pub enum SymExtractPart {
+    #[default]
+    Unknown,
+    PreClose,
+    PostClose,
 }
 
 fn deserialize_level<'de, D>(deserializer: D) -> Result<Option<Level>, D::Error>

@@ -41,9 +41,6 @@ use windows_service::{define_windows_service, service_dispatcher};
 #[derive(Parser, Debug)]
 #[command(next_line_help = true)]
 pub struct Cli {
-    #[arg(long, action = ArgAction::SetTrue, default_value_t = true)]
-    stdout: bool,
-
     #[arg(long, action = ArgAction::SetTrue)]
     cli: bool,
 
@@ -71,6 +68,8 @@ pub struct Cli {
     threads: Option<usize>,
     #[arg(long, action = ArgAction::SetTrue)]
     debug: bool,
+    #[arg(long, action = ArgAction::SetTrue)]
+    dry: bool,
     #[arg(long)]
     hostname: Option<String>,
     #[arg(long)]
@@ -121,8 +120,7 @@ pub fn main() -> anyhow::Result<()> {
         LogTracer::init()?;
     }
 
-    let appender =
-        tracing_appender::rolling::daily(r#"C:\dev\extract-downloader\logs"#, "log_test.log");
+    let appender = tracing_appender::rolling::daily(r#".\logs"#, "downloader.log");
     let (non_blocking_file, _guard) = tracing_appender::non_blocking(appender);
 
     let file_log = fmt::layer()
@@ -134,7 +132,7 @@ pub fn main() -> anyhow::Result<()> {
     let logger = tracing_subscriber::registry();
     let logger = logger.with(file_log);
 
-    let console_log = if cli.stdout {
+    let console_log = if cli.cli {
         Some(
             fmt::layer()
                 .with_timer(TIMER.get().unwrap())

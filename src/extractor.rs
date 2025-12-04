@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::clients::{SftpClient, SshClient};
-use crate::config::Config;
+use crate::config::{Config, Sym, SymExtractPart};
 use crate::{DAY, HALF_HOUR, HOUR};
 
 pub struct Extractor {
@@ -38,6 +38,9 @@ impl Extractor {
     pub async fn close(&mut self) {
         let _ = self.get_sftp().write().await.close().await;
         let _ = self.get_ssh().write().await.close().await;
+
+        self.sftp_session = None;
+        self.ssh_session = None;
     }
 
     pub async fn watch(&mut self) -> anyhow::Result<()> {
@@ -45,8 +48,13 @@ impl Extractor {
         self.connect_sftp().await?;
 
         while !self.extracts_running().await? && !self.config.debug {
+            self.close().await;
+
             debug!("Waiting 15 minutes for ARCU Extracts to be running...");
-            tokio::time::sleep(Duration::from_secs(300 * 3)).await
+            tokio::time::sleep(Duration::from_secs(300 * 3)).await;
+
+            self.connect_ssh().await?;
+            self.connect_sftp().await?;
         }
 
         self.process().await
@@ -57,7 +65,6 @@ impl Extractor {
         self.connect_ssh().await?;
         self.connect_sftp().await?;
 
-        // Check and wait for completion of running ARCU extracts.
         trace!("Checking for ARCU Extracts to be finished.");
         while self.extracts_running().await? {
             debug!("Waiting 5 minutes for ARCU Extracts to be finished...");
@@ -74,12 +81,12 @@ impl Extractor {
             }
 
             let dir = format!("/SYM/SYM{}/SQLEXTRACT", sym.number);
-            files.append(&mut self.init_files(sym.number, dir, |_| true).await?);
+            files.append(&mut self.init_files(sym, dir, |_| true).await?);
 
             let dir = format!("/SYM/SYM{}/LETTERSPECS", sym.number);
             files.append(
                 &mut self
-                    .init_files(sym.number, dir, |f| {
+                    .init_files(sym, dir, |f| {
                         !f.file_name().contains("DataSupp.")
                             && (f.file_name().starts_with("EXTRACT.")
                                 || f.file_name().starts_with("FMT.")
@@ -160,14 +167,16 @@ impl Extractor {
             return Err(anyhow::anyhow!("No Lastfile in file listing?"));
         }
 
-        self.move_files(files)?;
+        if !self.config.dry {
+            self.move_files(files)?;
+        }
 
         Ok(())
     }
 
     async fn init_files<P>(
         &self,
-        sym: u16,
+        sym: &Sym,
         dir: String,
         filter: P,
     ) -> anyhow::Result<Vec<ExtractFile>>
@@ -258,13 +267,16 @@ impl Extractor {
         Ok(files)
     }
 
-    fn move_files(&self, files: Vec<ExtractFile>) -> anyhow::Result<()> {
+    fn move_files(&self, mut files: Vec<ExtractFile>) -> anyhow::Result<()> {
         if !std::fs::exists(&self.config.destination)
             .context("Attempting to verify destination path")?
         {
             std::fs::create_dir(&self.config.destination).context("")?;
         }
         let mut moved = Vec::new();
+
+        files.sort_by_key(|f| f.sym);
+        trace!("Moving files: \n{files:#?}");
         for file in files
             .iter()
             .filter(|f| f.file_name != "EXTRACT_LASTFILE.txt")
@@ -494,6 +506,7 @@ impl Extractor {
 struct ExtractFile {
     file_name: String,
     sym: u16,
+    extract_part: SymExtractPart,
     remote_path: String,
     local_path: String,
 
@@ -504,13 +517,15 @@ struct ExtractFile {
 }
 
 impl ExtractFile {
-    fn new(entry: DirEntry, path: &String, sym: u16, len: u64) -> Self {
+    fn new(entry: DirEntry, path: &String, sym: &Sym, len: u64) -> Self {
         let file_name = entry.file_name();
+
         ExtractFile {
             file_name: file_name.clone(),
-            sym,
+            sym: sym.number,
+            extract_part: sym.extract_part.clone(),
             remote_path: format!(r#"{path}/{file_name}"#),
-            local_path: format!(r#".\extracts\{}\{file_name}"#, sym),
+            local_path: format!(r#".\extracts\{}\{file_name}"#, sym.number),
             len,
             ..Default::default()
         }
