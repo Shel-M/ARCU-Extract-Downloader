@@ -70,18 +70,17 @@ impl Config {
         let config_string =
             read_to_string("./config.toml").expect("Unable to find or open config.toml");
 
-        let ret: ConfigOptions = toml::from_str::<ConfigOptions>(&config_string)
+        let config_options: ConfigOptions = toml::from_str::<ConfigOptions>(&config_string)
             .expect("Could not deserialize config.toml");
-        ret.into()
+
+        let config: Self = config_options.into();
+
+        config.check_config_panics("config.toml ");
+        config
     }
 
     pub fn with_cli(mut self, cli: &Cli) -> Self {
         if let Some(ref destination) = cli.destination {
-            assert!(
-                fs::exists(destination).is_ok_and(|v| v),
-                "Argument --destination '{}' does not exist or may be an invalid path!",
-                destination.display()
-            );
             self.destination = destination.clone();
         }
         if let Some(log_level) = cli.log_level {
@@ -110,6 +109,7 @@ impl Config {
 
         self.experimental = self.experimental || cli.experimental;
 
+        self.check_config_panics("Argument --");
         self
     }
 
@@ -118,6 +118,51 @@ impl Config {
     }
     pub fn sym_jobs(&self) -> Vec<&String> {
         self.syms.iter().map(|s| &s.extract_job).collect()
+    }
+
+    fn check_config_panics(&self, source: &str) {
+        let mut errors = Vec::new();
+
+        if !fs::exists(&self.destination).is_ok_and(|v| v) {
+            errors.push(format!(
+                "{source}destination '{}' does not exist or may be an invalid path!",
+                self.destination.display()
+            ));
+        }
+
+        match self.syms.len() {
+            0 => errors.push(format!("{source}syms not defined.")),
+            1 => {
+                let sym = &self.syms[0];
+                if matches!(
+                    sym.extract_part,
+                    SymExtractPart::PreClose | SymExtractPart::PostClose
+                ) {
+                    errors.push(format!("{source}sym {} extract_part should be excluded, 'Single', or there should be two syms defined", sym.number))
+                }
+            }
+            2 => {
+                let mut syms = [&self.syms[0], &self.syms[1]];
+                syms.sort_by_key(|s| s.extract_part);
+
+                if !matches!(syms[0].extract_part, SymExtractPart::PreClose) {
+                    errors.push(format!("{source}sym {} extract_part should be defined as 'PreClose' or 'PostClose' for split extract jobs", 
+                        syms[0].number))
+                }
+                if !matches!(syms[1].extract_part, SymExtractPart::PostClose) {
+                    errors.push(format!("{source}sym {} extract_part should be defined as 'PreClose' or 'PostClose' for split extract jobs", 
+                        syms[1].number))
+                }
+            }
+            _ => errors.push(format!("{source}syms cannot have more than 2 items.")),
+        }
+
+        if !errors.is_empty() {
+            for config_error in errors {
+                println!("{config_error}");
+            }
+            panic!("Configuration has errors!")
+        }
     }
 }
 
@@ -160,10 +205,11 @@ pub struct Sym {
     pub extract_part: SymExtractPart,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, PartialOrd, Default)]
+#[derive(Debug, Copy, Clone, Deserialize, Eq, Ord, PartialEq, PartialOrd, Default)]
 pub enum SymExtractPart {
     #[default]
     Unknown,
+    Single,
     PreClose,
     PostClose,
 }
