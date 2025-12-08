@@ -290,7 +290,11 @@ where
                         Err(e) => {
                             error!("Extractor failed: {e}"); //?;
                             _ = std::fs::remove_dir_all(r#".\extracts\"#);
-                            continue;
+                            if config.debug {
+                                break;
+                            } else {
+                                continue;
+                            }
                         }
                     }
                 }
