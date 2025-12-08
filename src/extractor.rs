@@ -1,7 +1,9 @@
+use std::fmt::Display;
+use std::fs::read_to_string;
 // #![allow(unused)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::anyhow;
@@ -12,7 +14,6 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::clients::{SftpClient, SshClient};
 use crate::config::{Config, Sym, SymExtractPart};
-use crate::{DAY, HALF_HOUR, HOUR};
 
 pub struct Extractor {
     sftp_session: Option<Arc<RwLock<SftpClient>>>,
@@ -71,6 +72,32 @@ impl Extractor {
             tokio::time::sleep(Duration::from_secs(300)).await
         }
 
+        // let mut files = Vec::new();
+        // let sym = self.config.syms.iter().find(|s| s.number == 658).unwrap();
+        // let dir = format!("/SYM/SYM{}/LETTERSPECS", sym.number);
+        // files.append(
+        //     &mut self
+        //         .init_files(sym, dir, |f| {
+        //             !f.file_name().contains("DataSupp.")
+        //             &&
+        //             // && (f.file_name().starts_with("EXTRACT.")
+        //             //     || f.file_name().starts_with("FMT.")
+        //             //     || f.file_name().starts_with("MACRO.")
+        //             //    ||
+        //             f.file_name().starts_with("CD_Trial_Bal_for_")
+        //             //     || f.file_name() == "CD_Trial"
+        //             //     || f.file_name() == "Episys_DataSupp_Statistics.txt"
+        //             //     || f.file_name() == "Episys_Database__Extract_Stats"
+        //             //     || f.file_name() == "EXTRACT_LASTFILE.txt")
+        //         })
+        //         .await?,
+        // );
+        //
+        // assert!(
+        //     files.iter().any(|f| f.file_name.starts_with("CD")),
+        //     "CD Trial Bal Not Found"
+        // );
+
         let mut files = Vec::new();
         for sym in &self.config.syms {
             let local_path = format!(r#".\extracts\{}"#, sym.number);
@@ -81,7 +108,14 @@ impl Extractor {
             }
 
             let dir = format!("/SYM/SYM{}/SQLEXTRACT", sym.number);
-            files.append(&mut self.init_files(sym, dir, |_| true).await?);
+            files.append(
+                &mut self
+                    .init_files(sym, dir, |d| {
+                        !d.file_type().is_dir()
+                            || (d.file_type().is_dir() && d.file_name().starts_with("EPIO"))
+                    })
+                    .await?,
+            );
 
             let dir = format!("/SYM/SYM{}/LETTERSPECS", sym.number);
             files.append(
@@ -91,7 +125,7 @@ impl Extractor {
                             && (f.file_name().starts_with("EXTRACT.")
                                 || f.file_name().starts_with("FMT.")
                                 || f.file_name().starts_with("MACRO.")
-                                || f.file_name() == "CD_Trial_Bal_for_"
+                                || f.file_name().starts_with("CD_Trial_Bal_for_")
                                 || f.file_name() == "Episys_DataSupp_Statistics.txt"
                                 || f.file_name() == "Episys_Database__Extract_Stats"
                                 || f.file_name() == "EXTRACT_LASTFILE.txt")
@@ -99,6 +133,10 @@ impl Extractor {
                     .await?,
             );
         }
+        assert!(
+            files.iter().any(|f| f.file_name.starts_with("CD")),
+            "CD Trial Bal Not Found"
+        );
 
         files.sort_by_key(|k| k.len);
         trace!("{files:#?}");
@@ -151,13 +189,30 @@ impl Extractor {
             }
             let queues = task_set.join_all().await;
 
-            for queue in queues {
-                let mut queue = queue?;
-                files.append(&mut queue);
+            for ref mut queue in queues {
+                files.append(queue);
+            }
+
+            if files.iter().filter(|f| f.error || !f.complete).count() == 0 {
+                break;
             }
         }
 
-        // Non-feature parity Todo: Parse and build datasupp file
+        let files_len = files.len();
+        files.sort_by_key(|f| f.len);
+        files.dedup_by(|a, b| {
+            a.remote_path
+                .eq_ignore_ascii_case(&b.remote_path.to_ascii_lowercase())
+        });
+        if files_len < files.len() {
+            return Err(anyhow::anyhow!("File duplication detected."));
+        }
+
+        // Todo: If we have two syms, find the datasupp statistics files, remove from files, send to
+        // function that uses them to create and returns a new stats ExtractFile.
+        // Maybe just hand in the mutable files list?
+        combine_datasupp_stats(&mut files);
+
         if files
             .iter()
             .filter(|f| f.file_name == "EXTRACT_LASTFILE.txt")
@@ -169,6 +224,8 @@ impl Extractor {
 
         if !self.config.dry {
             self.move_files(files)?;
+        } else {
+            debug!("Not moving files to destination due to running as 'dry'");
         }
 
         Ok(())
@@ -185,26 +242,10 @@ impl Extractor {
     {
         let mut files = Vec::new();
 
-        // Note: File age check may not be necessary once we're also correctly watching for the ARCU job
-        // completion.
-
-        // If running debug, we can
-        // grab the last day of files. If not, just the last hour should do it.
-        let file_age = if self.config.debug {
-            DAY
-        } else {
-            HOUR + HALF_HOUR
-        };
-
         let client = self.get_sftp();
         let client = client.read().await;
 
-        for entry in client.read_dir(&dir).await?.filter(filter).filter(|f| {
-            f.metadata().modified().unwrap()
-                > SystemTime::now()
-                    .checked_sub(Duration::from_secs(file_age))
-                    .unwrap()
-        }) {
+        for entry in client.read_dir(&dir).await?.filter(filter) {
             if entry.file_type().is_dir() {
                 let dir = format!("{dir}/{}", entry.file_name());
                 debug!("Polling files in dir: {dir}");
@@ -216,7 +257,7 @@ impl Extractor {
                     }
                 }
             } else {
-                debug!("file in dir: {dir} {:?}", &entry.file_name());
+                debug!("file in dir: {dir} \"{}\"", &entry.file_name());
                 let len = entry.metadata().len();
                 files.push(ExtractFile::new(entry, &dir, sym, len));
             }
@@ -262,49 +303,47 @@ impl Extractor {
             for mut queue in queues {
                 files.append(&mut queue);
             }
+
+            if files.iter().filter(|f| f.error).count() == 0 {
+                break;
+            }
         }
 
         Ok(files)
     }
 
-    fn move_files(&self, mut files: Vec<ExtractFile>) -> anyhow::Result<()> {
+    fn move_files(&self, files: Vec<ExtractFile>) -> anyhow::Result<()> {
         if !std::fs::exists(&self.config.destination)
             .context("Attempting to verify destination path")?
         {
             std::fs::create_dir(&self.config.destination).context("")?;
         }
-        let mut moved = Vec::new();
 
-        files.sort_by_key(|f| f.sym);
         trace!("Moving files: \n{files:#?}");
         for file in files
             .iter()
             .filter(|f| f.file_name != "EXTRACT_LASTFILE.txt")
         {
-            if !moved.contains(&file.local_path) {
-                debug!("Moving {}", file.local_path);
-                moved.push(file.local_path.clone());
-                let mut file_destination = self.config.destination.clone();
+            debug!("Moving {}", file.local_path);
+            let mut file_destination = self.config.destination.clone();
 
-                // These files hit length limits for converting to letter files
-                // so, we'll rename to the expected format here
-                if file.file_name == *"Episys_Database__Extract_Stats" {
-                    file_destination.push("Episys_Database__Extract_Statistics.txt");
-                } else if file.file_name.starts_with("CD_Trial_Bal_for_") {
-                    // IE CD_Trial_Bal_for_01_03_24
-                    let date = &file.file_name.trim_start_matches("CD_Trial_Bal_for_");
-                    file_destination
-                        .push("Close_Day_Trial_Balance_for_".to_owned() + date + ".txt");
-                } else {
-                    file_destination.push(&file.file_name);
-                }
-
-                std::fs::rename(&file.local_path, &file_destination).context(format!(
-                    "Failed to move file '{}' to '{}'",
-                    file.local_path,
-                    &file_destination.display()
-                ))?
+            // These files hit length limits for converting to letter files
+            // so, we'll rename to the expected format here
+            if file.file_name == *"Episys_Database__Extract_Stats" {
+                file_destination.push("Episys_Database__Extract_Statistics.txt");
+            } else if file.file_name.starts_with("CD_Trial_Bal_for_") {
+                // IE CD_Trial_Bal_for_01_03_24
+                let date = &file.file_name.trim_start_matches("CD_Trial_Bal_for_");
+                file_destination.push("Close_Day_Trial_Balance_for_".to_owned() + date + ".txt");
+            } else {
+                file_destination.push(&file.file_name);
             }
+
+            std::fs::rename(&file.local_path, &file_destination).context(format!(
+                "Failed to move file '{}' to '{}'",
+                file.local_path,
+                &file_destination.display()
+            ))?
         }
 
         debug!("Moving last file.");
@@ -397,6 +436,24 @@ impl Extractor {
         queue
     }
 
+    async fn queue_downloads(
+        sftp: Arc<RwLock<SftpClient>>,
+        mut queue: Vec<ExtractFile>,
+        q_number: usize,
+    ) -> Vec<ExtractFile> {
+        for file in queue.iter_mut() {
+            debug!(
+                "Downloading '{}' in queue {q_number} (len: {})",
+                file.file_name, file.len
+            );
+            if let Err(e) = Self::download(sftp.clone(), file).await {
+                error!("Error downloading file '{}' ({})", file.file_name, e);
+                file.error = true;
+            };
+        }
+        queue
+    }
+
     async fn download(sftp: Arc<RwLock<SftpClient>>, file: &mut ExtractFile) -> anyhow::Result<()> {
         let local_file = format!("{}\\{}", file.local_path, file.file_name);
 
@@ -431,21 +488,6 @@ impl Extractor {
 
         file.complete = true;
         Ok(())
-    }
-
-    async fn queue_downloads(
-        sftp: Arc<RwLock<SftpClient>>,
-        mut queue: Vec<ExtractFile>,
-        q_number: usize,
-    ) -> anyhow::Result<Vec<ExtractFile>> {
-        for file in queue.iter_mut() {
-            debug!(
-                "Downloading '{}' in queue {q_number} (len: {})",
-                file.file_name, file.len
-            );
-            Self::download(sftp.clone(), file).await?;
-        }
-        Ok(queue)
     }
 
     pub async fn connect_sftp(&mut self) -> anyhow::Result<()> {
@@ -523,7 +565,7 @@ impl ExtractFile {
         ExtractFile {
             file_name: file_name.clone(),
             sym: sym.number,
-            extract_part: sym.extract_part.clone(),
+            extract_part: sym.extract_part,
             remote_path: format!(r#"{path}/{file_name}"#),
             local_path: format!(r#".\extracts\{}\{file_name}"#, sym.number),
             len,
@@ -682,4 +724,111 @@ impl From<&str> for BatchQueueStatus {
             _ => Self::Unknown(value.to_string()),
         }
     }
+}
+
+struct DataSupp {
+    accounts: u64,
+    loans: u64,
+    shares: u64,
+}
+
+impl Display for DataSupp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            r#"AccountDataSupp:{:012}
+LoanDataSupp:{:012}
+ShareDataSupp:{:012}
+"#,
+            self.accounts, self.loans, self.shares
+        )
+    }
+}
+
+fn combine_datasupp_stats(files: &mut Vec<ExtractFile>) {
+    let mut datasupp_out = DataSupp {
+        accounts: 0,
+        loans: 0,
+        shares: 0,
+    };
+
+    let mut datasupps = Vec::new();
+    for (i, _) in files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.file_name == "Episys_DataSupp_Statistics.txt")
+    {
+        datasupps.push(i)
+    }
+    if datasupps.len() == 1 {
+        return;
+    }
+
+    let mut datasupp_files = datasupps
+        .iter()
+        .map(|i| files.swap_remove(*i))
+        .collect::<Vec<ExtractFile>>();
+    datasupp_files.sort_by_key(|f| f.extract_part);
+
+    // Process PreClose file content
+    let content = read_to_string(&datasupp_files[0].local_path).unwrap_or_else(|_| {
+        panic!(
+            "Cannot read datasupp file at '{}'",
+            datasupp_files[0].local_path
+        )
+    });
+    let content = content.lines().collect::<Vec<&str>>();
+
+    for line in content {
+        let pos = line
+            .find(':')
+            .expect("Episys_DataSupp_Statistics.txt malformed");
+        let value = line[pos + 1..]
+            .parse::<u64>()
+            .expect("Episys_DataSupp_Statistics.txt malformed");
+
+        if line.starts_with('A') {
+            datasupp_out.accounts += value
+        } else if line.starts_with('L') {
+            datasupp_out.loans += value
+        } else if line.starts_with('S') {
+            datasupp_out.shares += value
+        };
+    }
+
+    // Process PostClose file content
+    let content = read_to_string(&datasupp_files[1].local_path).unwrap_or_else(|_| {
+        panic!(
+            "Cannot read datasupp file at '{}'",
+            datasupp_files[1].local_path
+        )
+    });
+    let content = content.lines().collect::<Vec<&str>>();
+
+    for line in content {
+        let pos = line
+            .find(':')
+            .expect("Episys_DataSupp_Statistics.txt malformed");
+        let value = line[pos + 1..]
+            .parse::<u64>()
+            .expect("Episys_DataSupp_Statistics.txt malformed");
+
+        if line.starts_with("AccountDataSupp") && datasupp_out.accounts == 0 {
+            datasupp_out.accounts = value
+        } else if line.starts_with("LoanDataSupp") && datasupp_out.loans == 0 {
+            datasupp_out.loans += value
+        } else if line.starts_with("ShareDataSupp") && datasupp_out.shares == 0 {
+            datasupp_out.shares += value
+        };
+    }
+
+    let mut output_file = datasupp_files
+        .pop()
+        .expect("Impossible empty datasupp_files");
+    output_file.local_path = format!(r#".\extracts\{}"#, output_file.file_name);
+
+    std::fs::write(&output_file.local_path, datasupp_out.to_string())
+        .expect("Could not write computed datasupp file");
+
+    files.push(output_file);
 }
