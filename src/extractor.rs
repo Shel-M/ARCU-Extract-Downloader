@@ -3,7 +3,7 @@ use std::fs::read_to_string;
 // #![allow(unused)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use anyhow::anyhow;
@@ -312,7 +312,9 @@ impl Extractor {
         Ok(files)
     }
 
-    fn move_files(&self, files: Vec<ExtractFile>) -> anyhow::Result<()> {
+    fn move_files(&self, mut files: Vec<ExtractFile>) -> anyhow::Result<()> {
+        files.sort_by_key(|f| f.modified);
+
         if !std::fs::exists(&self.config.destination)
             .context("Attempting to verify destination path")?
         {
@@ -343,7 +345,7 @@ impl Extractor {
                 "Failed to move file '{}' to '{}'",
                 file.local_path,
                 &file_destination.display()
-            ))?
+            ))?;
         }
 
         debug!("Moving last file.");
@@ -544,7 +546,7 @@ impl Extractor {
 }
 
 #[allow(unused)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ExtractFile {
     file_name: String,
     sym: u16,
@@ -554,6 +556,7 @@ struct ExtractFile {
 
     checksum: String,
     len: u64,
+    modified: SystemTime,
     error: bool,
     complete: bool,
 }
@@ -568,8 +571,15 @@ impl ExtractFile {
             extract_part: sym.extract_part,
             remote_path: format!(r#"{path}/{file_name}"#),
             local_path: format!(r#".\extracts\{}\{file_name}"#, sym.number),
+
+            checksum: String::with_capacity(32),
             len,
-            ..Default::default()
+            modified: entry
+                .metadata()
+                .modified()
+                .expect("Could not get modified date"),
+            error: false,
+            complete: false,
         }
     }
 }
@@ -736,10 +746,7 @@ impl Display for DataSupp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            r#"AccountDataSupp:{:012}
-LoanDataSupp:{:012}
-ShareDataSupp:{:012}
-"#,
+            "AccountDataSupp:{:012}\r\nLoanDataSupp:{:012}\r\nShareDataSupp:{:012}\r\n",
             self.accounts, self.loans, self.shares
         )
     }
