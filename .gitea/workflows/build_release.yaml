@@ -29,15 +29,16 @@ jobs:
         with:
           targets: x86_64-pc-windows-gnu
 
-      # Optional but recommended (aws-lc-sys builds are heavy)
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ hashFiles('**/Cargo.lock') }}
+      # # Optional but recommended (aws-lc-sys builds are heavy)
+      # # Not caching at this time, storage is more premium than CPU time.
+      # - name: Cache cargo
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: |
+      #       ~/.cargo/registry
+      #       ~/.cargo/git
+      #       target
+      #     key: cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (release, windows x86_64 GNU)
         env:
