@@ -1,0 +1,62 @@
+name: release-windows-x86_64
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps (mingw-w64 + zip + jq)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mingw-w64 \
+            zip \
+            jq
+
+      - name: Install Rust toolchain
+        # If you already pin via rust-toolchain.toml, this will respect it.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Build (release, windows x86_64 GNU)
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Derive crate name (first package) and create a friendly archive name
+          CRATE_NAME="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')"
+          TAG_NAME="${GITEA_REF_NAME:-${GITHUB_REF_NAME:-unknown-tag}}"
+
+          OUT_DIR="dist"
+          mkdir -p "$OUT_DIR"
+
+          BIN_PATH="target/x86_64-pc-windows-gnu/release/${CRATE_NAME}.exe"
+
+          # If your produced .exe name differs (workspace, multiple bins, etc),
+          # change BIN_PATH accordingly (or package the whole release dir).
+          test -f "$BIN_PATH"
+
+          ARCHIVE="${OUT_DIR}/${CRATE_NAME}-${TAG_NAME}-windows-x86_64.zip"
+          zip -j "$ARCHIVE" "$BIN_PATH"
+
+          echo "Built: $BIN_PATH"
+          echo "Packaged: $ARCHIVE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
