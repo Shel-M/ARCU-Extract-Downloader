@@ -13,13 +13,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system deps (mingw-w64 + zip + jq)
+      - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             mingw-w64 \
             cmake \
             ninja-build \
+            nasm \
             zip \
             jq
 
