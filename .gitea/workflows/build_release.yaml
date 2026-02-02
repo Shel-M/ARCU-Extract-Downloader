@@ -30,16 +30,17 @@ jobs:
         with:
           targets: x86_64-pc-windows-gnu
 
-      # # Optional but recommended (aws-lc-sys builds are heavy)
-      # # Not caching at this time, storage is more premium than CPU time.
-      # - name: Cache cargo
-      #   uses: actions/cache@v4
-      #   with:
-      #     path: |
-      #       ~/.cargo/registry
-      #       ~/.cargo/git
-      #       target
-      #     key: cargo-${{ hashFiles('**/Cargo.lock') }}
+      # Optional but recommended (aws-lc-sys builds are heavy)
+      - name: Cache cargo
+        uses: LordBaryhobal/gitea-cache-action@v4 # actions/cache@v4
+        with:
+            path: |
+              ~/.cargo/bin/
+              ~/.cargo/registry/index/
+              ~/.cargo/registry/cache/
+              ~/.cargo/git/db/
+              target/
+            key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (release, windows x86_64 GNU)
         env:
@@ -79,15 +80,25 @@ jobs:
           # change BIN_PATH accordingly (or package the whole release dir).
           test -f "$BIN_PATH"
 
-          ARCHIVE="${OUT_DIR}/${CRATE_NAME}-${TAG_NAME}-windows-x86_64.zip"
-          zip -j "$ARCHIVE" "$BIN_PATH"
+          # ARCHIVE="${OUT_DIR}/${CRATE_NAME}-${TAG_NAME}-windows-x86_64.zip"
+          # zip -j "$ARCHIVE" "$BIN_PATH"
+          cp $BIN_PATH $OUT_DIR
 
           echo "Built: $BIN_PATH"
-          echo "Packaged: $ARCHIVE"
+          echo "Packaged: $OUT_DIR"
 
-      - name: Upload artifact
-        uses: https://github.com/christopherHX/gitea-upload-artifact@v4
+      # - name: Upload artifact
+      #   uses: christopherHX/gitea-upload-artifact@v4
+      #   with:
+      #     name: windows-x86_64
+      #     path: dist/*.exe
+      #     if-no-files-found: error
+
+      - name: Upload release
+        uses: akkuman/gitea-release-action@v1
+        env:
+          NODE_TLS_REJECT_UNAUTHORIZED=false
         with:
-          name: windows-x86_64
-          path: dist/*.zip
-          if-no-files-found: error
+          draft: true
+          files: |-
+            dist/*.exe
